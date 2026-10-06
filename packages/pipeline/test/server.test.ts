@@ -1,0 +1,331 @@
+/**
+ * Tests for server.ts — the frozen REST contract (ARCHITECTURE.md §8).
+ * The Pipeline is a FAKE (in-memory, instant); HTTP behaviour, status codes,
+ * error shape and SSE framing are what's under test. No network beyond
+ * loopback. Run: npm test (tsc → node --test dist/test)
+ */
+import { describe, it, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import type { AddressInfo } from 'node:net';
+import type { ChatRequest, Spec } from '@shorts-forge/shared';
+import { createServer } from '../src/server.js';
+import { ApiError, JobStore, type Job, type JobEvent, type Pipeline } from '../src/index.js';
+import type { Server } from 'node:http';
+
+function validSpec(): Spec {
+  return {
+    version: 1,
+    title: 'Título',
+    format: '9:16',
+    language: 'pt-PT',
+    segments: [
+      {
+        id: 'seg-01',
+        narration: 'Narração de teste.',
+        visualKeywords: ['sun'],
+        brollDescription: 'Sol',
+        targetDurationSec: 4,
+      },
+    ],
+  };
+}
+
+/** Minimal in-memory Pipeline double backed by a real JobStore. */
+function fakePipeline(): { pipeline: Pipeline; store: JobStore } {
+  const store = new JobStore();
+  const pipeline: Pipeline = {
+    createJob: async (input, opts) => store.create(input, opts.format, opts.language),
+    generateSpec: async (id) => {
+      const job = store.get(id);
+      const spec = validSpec();
+      store.update(id, { spec, status: 'awaiting-approval' });
+      store.emit(id, 'awaiting-approval');
+      void job;
+      return spec;
+    },
+    approveSpec: async (id, spec) => {
+      const segments = (spec as unknown as { segments?: unknown[] })?.segments;
+      if (!Array.isArray(segments) || segments.length === 0) {
+        throw new ApiError('spec_invalid', 400, 'Spec inválida — campo "segments": tem de ser um array não vazio');
+      }
+      const updated = store.update(id, { spec, status: 'awaiting-approval' });
+      store.emit(id, 'awaiting-approval');
+      return updated;
+    },
+    render: async (id) => {
+      const updated = store.update(id, { status: 'rendering', progress: 0 });
+      store.emit(id, 'rendering');
+      return updated;
+    },
+    getJob: async (id) => store.get(id),
+    specEvents: async function* (id: string): AsyncIterable<JobEvent> {
+      store.get(id); // 404 when unknown
+      const queue: JobEvent[] = [];
+      let wake: (() => void) | null = null;
+      let terminal = false;
+      const unsub = store.subscribe(id, (event) => {
+        queue.push(event);
+        if (event.type === 'done' || event.type === 'failed') terminal = true;
+        const w = wake;
+        wake = null;
+        w?.();
+      });
+      try {
+        for (;;) {
+          while (queue.length > 0) yield queue.shift() as JobEvent;
+          if (terminal) return;
+          await new Promise<void>((r) => {
+            wake = r;
+          });
+        }
+      } finally {
+        unsub();
+      }
+    },
+  };
+  return { pipeline, store };
+}
+
+let server: Server;
+let base = '';
+let store!: JobStore;
+
+before(async () => {
+  const { pipeline, store: s } = fakePipeline();
+  store = s;
+  server = createServer({
+    pipeline,
+    chat: async (_req: ChatRequest) => ({ text: 'resposta fake', provider: 'fake', model: 'fake-1' }),
+    llmStatus: async () => [{ name: 'fake', reachable: true, keyless: true }],
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address() as AddressInfo;
+  base = `http://127.0.0.1:${addr.port}/api`;
+});
+
+after(async () => {
+  await new Promise<void>((resolve, reject) => {
+    server.close((err) => (err ? reject(err) : resolve()));
+  });
+});
+
+async function post(path: string, body?: unknown): Promise<{ status: number; json: any }> {
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const res = await fetch(`${base}${path}`, init);
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+async function put(path: string, body: unknown): Promise<{ status: number; json: any }> {
+  const res = await fetch(`${base}${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+async function get(path: string): Promise<{ status: number; json: any }> {
+  const res = await fetch(`${base}${path}`);
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+/** Reads `count` SSE `data:` frames from a stream, then cancels. */
+async function readSseFrames(res: Response, count: number, timeoutMs = 5000): Promise<any[]> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  const frames: unknown[] = [];
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (frames.length < count) {
+      if (Date.now() > deadline) throw new Error('timeout à espera de frames SSE');
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of raw.split('\n')) {
+          if (line.startsWith('data: ')) frames.push(JSON.parse(line.slice('data: '.length)));
+        }
+      }
+    }
+  } finally {
+    await reader.cancel();
+  }
+  return frames;
+}
+
+describe('jobs', () => {
+  it('POST /api/jobs → 201 { job }', async () => {
+    const { status, json } = await post('/jobs', {
+      input: { kind: 'topic', topic: 'hábitos matinais' },
+      format: '9:16',
+      language: 'pt-PT',
+    });
+    assert.equal(status, 201);
+    const job = json.job as Job;
+    assert.ok(job.id);
+    assert.equal(job.status, 'spec-draft');
+    assert.equal(job.progress, 0);
+    assert.deepEqual(job.input, { kind: 'topic', topic: 'hábitos matinais' });
+  });
+
+  it('POST /api/jobs sem input → 400 com forma de erro congelada', async () => {
+    const { status, json } = await post('/jobs', { format: '9:16' });
+    assert.equal(status, 400);
+    assert.ok(json.error, 'tem error');
+    assert.equal(typeof json.error.code, 'string');
+    assert.equal(typeof json.error.message, 'string');
+    assert.match(json.error.message, /input/);
+  });
+
+  it('GET /api/jobs/:id → 200 { job }; desconhecido → 404', async () => {
+    const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
+    const id = (created.json.job as Job).id;
+    const { status, json } = await get(`/jobs/${id}`);
+    assert.equal(status, 200);
+    assert.equal((json.job as Job).id, id);
+
+    const missing = await get('/jobs/job-que-nao-existe');
+    assert.equal(missing.status, 404);
+    assert.equal(missing.json.error.code, 'job_not_found');
+  });
+
+  it('POST /api/jobs/:id/spec → 200 { spec }', async () => {
+    const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
+    const id = (created.json.job as Job).id;
+    const { status, json } = await post(`/jobs/${id}/spec`);
+    assert.equal(status, 200);
+    assert.ok((json.spec as Spec).segments.length > 0);
+  });
+
+  it('PUT /api/jobs/:id/spec inválida → 400 spec_invalid', async () => {
+    const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
+    const id = (created.json.job as Job).id;
+    const { status, json } = await put(`/jobs/${id}/spec`, {
+      spec: { version: 1, title: 'x', format: '9:16', language: 'pt-PT', segments: [] },
+    });
+    assert.equal(status, 400);
+    assert.equal(json.error.code, 'spec_invalid');
+  });
+
+  it('PUT /api/jobs/:id/spec válida → 200 { job } em awaiting-approval', async () => {
+    const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
+    const id = (created.json.job as Job).id;
+    const { status, json } = await put(`/jobs/${id}/spec`, { spec: validSpec() });
+    assert.equal(status, 200);
+    assert.equal((json.job as Job).status, 'awaiting-approval');
+  });
+
+  it('POST /api/jobs/:id/render → 202 { job } em rendering', async () => {
+    const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
+    const id = (created.json.job as Job).id;
+    const { status, json } = await post(`/jobs/${id}/render`);
+    assert.equal(status, 202);
+    assert.equal((json.job as Job).status, 'rendering');
+  });
+});
+
+describe('SSE', () => {
+  it('GET /api/jobs/:id/events emite eventos com o tipo e o job', async () => {
+    const job = store.create({ kind: 'topic', topic: 't' }, '9:16', 'pt-PT');
+
+    const res = await fetch(`${base}/jobs/${job.id}/events`, {
+      headers: { Accept: 'text/event-stream' },
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /text\/event-stream/);
+
+    const reading = readSseFrames(res, 3);
+    // Dá tempo à subscrição antes de emitir.
+    await new Promise((r) => setTimeout(r, 50));
+    store.emit(job.id, 'progress', 'a meio');
+    store.update(job.id, { status: 'done', progress: 1 });
+    store.emit(job.id, 'done');
+
+    const frames = (await reading) as Array<{ type: string; job: Job; message?: string }>;
+    assert.equal(frames.length, 3);
+    assert.equal(frames[0]!.type, 'spec-draft', 'primeiro: snapshot do estado atual');
+    assert.equal(frames[1]!.type, 'progress');
+    assert.equal(frames[1]!.message, 'a meio');
+    assert.equal(frames[2]!.type, 'done');
+    assert.ok(frames.every((f) => f.job.id === job.id));
+  });
+
+  it('GET /api/jobs/:id/events de job desconhecido → 404', async () => {
+    const { status, json } = await get('/jobs/job-que-nao-existe/events');
+    assert.equal(status, 404);
+    assert.equal(json.error.code, 'job_not_found');
+  });
+});
+
+describe('download / preview', () => {
+  it('GET /api/jobs/:id/preview → 501 honesto (Fase 4)', async () => {
+    const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
+    const id = (created.json.job as Job).id;
+    const { status, json } = await get(`/jobs/${id}/preview`);
+    assert.equal(status, 501);
+    assert.equal(json.error.code, 'not_implemented');
+    assert.match(json.error.message, /Fase 4/);
+  });
+
+  it('GET /api/jobs/:id/download antes do fim → 409 job_not_finished', async () => {
+    const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
+    const id = (created.json.job as Job).id;
+    const { status, json } = await get(`/jobs/${id}/download`);
+    assert.equal(status, 409);
+    assert.equal(json.error.code, 'job_not_finished');
+  });
+
+  it('GET /api/jobs/:id/download com job done mas sem MP4 → 409 video_not_ready', async () => {
+    const job = store.create({ kind: 'topic', topic: 't' }, '9:16', 'pt-PT');
+    store.update(job.id, { status: 'done', progress: 1 });
+    const { status, json } = await get(`/jobs/${job.id}/download`);
+    assert.equal(status, 409);
+    assert.equal(json.error.code, 'video_not_ready');
+    assert.match(json.error.message, /Fase 4/);
+  });
+
+  it('GET /api/jobs/:id/download de job desconhecido → 404', async () => {
+    const { status } = await get('/jobs/job-que-nao-existe/download');
+    assert.equal(status, 404);
+  });
+});
+
+describe('llm', () => {
+  it('GET /api/llm/status → 200 { providers }', async () => {
+    const { status, json } = await get('/llm/status');
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(json.providers));
+    assert.equal(json.providers[0].name, 'fake');
+    assert.equal(json.providers[0].keyless, true);
+  });
+
+  it('POST /api/llm/chat → passthrough do ChatResult', async () => {
+    const req: ChatRequest = { messages: [{ role: 'user', content: 'olá' }] };
+    const { status, json } = await post('/llm/chat', req);
+    assert.equal(status, 200);
+    assert.equal(json.text, 'resposta fake');
+    assert.equal(json.provider, 'fake');
+  });
+
+  it('POST /api/llm/chat sem messages → 400', async () => {
+    const { status, json } = await post('/llm/chat', { messages: [] });
+    assert.equal(status, 400);
+    assert.equal(json.error.code, 'bad_request');
+  });
+});
+
+describe('rotas desconhecidas', () => {
+  it('GET /api/nope → 404 { error }', async () => {
+    const { status, json } = await get('/nope');
+    assert.equal(status, 404);
+    assert.equal(json.error.code, 'not_found');
+  });
+});

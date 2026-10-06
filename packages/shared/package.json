@@ -1,0 +1,18 @@
+{
+  "description": "Canonical TypeScript types shared by all shorts-forge packages (llm-router, pipeline, transcription, tts, video, ui). These types are the contract: do not change them without cross-team agreement.",
+  "exports": {
+    ".": "./dist/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "AGPL-3.0-only",
+  "main": "./dist/index.js",
+  "name": "@shorts-forge/shared",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "version": "0.1.0"
+}

@@ -1,0 +1,1 @@
+{"description":"Serviço Python de transcrição (faster-whisper). Implementação na Fase 2; este pacote documenta o contrato HTTP.","license":"AGPL-3.0-only","name":"@shorts-forge/transcription","private":true,"version":"0.1.0"}

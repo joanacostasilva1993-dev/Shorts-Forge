@@ -1,0 +1,23 @@
+{
+  "dependencies": {
+    "@shorts-forge/shared": "0.1.0",
+    "hyperframes": "^0.8.134"
+  },
+  "description": "Video rendering for shorts-forge: brand templates, karaoke captions from real TTS word timestamps, Hyperframes frame composition, and FFmpeg final assembly. Free/local-first.",
+  "exports": {
+    ".": "./dist/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "AGPL-3.0-only",
+  "main": "./dist/index.js",
+  "name": "@shorts-forge/video",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "version": "0.1.0"
+}

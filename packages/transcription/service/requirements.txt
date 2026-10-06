@@ -1,0 +1,15 @@
+# AGPL-3.0-only
+# Serviço de transcrição shorts-forge (faster-whisper).
+# Instalar com:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# NOTA: av fica PINADO a <19 porque o faster-whisper 1.2.1 chama
+# av.open(..., metadata_errors="ignore"), parâmetro removido no av 19
+# ("open() got an unexpected keyword argument 'metadata_errors'").
+# Não subir o pin sem testar POST /transcribe com áudio real.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+onnxruntime==1.30.0
+av==16.0.1
+tokenizers==0.23.2
+huggingface_hub==1.33.0
+numpy==2.5.3

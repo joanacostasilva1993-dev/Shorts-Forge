@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# shorts-forge TTS service — pinned Python dependencies.
+#
+# Install order matters for torch: install the CPU-only build FIRST, then
+# this file (otherwise pip fetches the ~550MB CUDA bundle from PyPI):
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   .venv/bin/pip install -r requirements.txt
+#
+# Pinned 2026-10-06 (verified working set). Notes:
+# - av==16.1.0: faster-whisper 1.2.1 calls av.open(..., metadata_errors=...),
+#   which av>=17/19 removed. Do NOT upgrade av past 16.x without re-testing.
+# - torch is intentionally NOT pinned to a CUDA build here; the CPU build
+#   comes from the pytorch index (see above).
+
+anyio==4.15.1
+av==16.1.0
+edge-tts==7.2.8
+fastapi==0.142.2
+faster-whisper==1.2.1
+google-cloud-texttospeech==2.31.0
+httpx==0.28.1
+huggingface-hub==1.33.0
+kokoro==0.9.4
+pydantic==2.13.5
+pytest==9.1.1
+soundfile==0.14.0
+starlette==1.7.0
+uvicorn==0.54.0

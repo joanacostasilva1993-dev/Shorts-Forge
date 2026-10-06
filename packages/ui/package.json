@@ -1,0 +1,27 @@
+{
+  "dependencies": {
+    "@mlc-ai/web-llm": "^0.2.85",
+    "@shorts-forge/shared": "0.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "description": "Web app local do shorts-forge: assistente de 4 passos (origem → voz → modelo visual → formato) com 3 portas de revisão. Esqueleto da Fase 5: dados de exemplo, backend ainda não ligado.",
+  "devDependencies": {
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "~5.9.2",
+    "vite": "^8.3.2"
+  },
+  "name": "@shorts-forge/ui",
+  "private": true,
+  "scripts": {
+    "build": "tsc -b && vite build",
+    "clean": "rm -rf dist",
+    "dev": "vite",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

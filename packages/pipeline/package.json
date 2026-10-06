@@ -1,0 +1,30 @@
+{
+  "dependencies": {
+    "@shorts-forge/shared": "^0.1.0",
+    "@shorts-forge/llm-router": "^0.1.0",
+    "@shorts-forge/video": "^0.1.0"
+  },
+  "description": "Orquestrador do pipeline shorts-forge: Fase A (Spec via LLM), Fase B (TTS + re-temporização), gestão de jobs, SSE e API REST em http://localhost:3000/api.",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "AGPL-3.0-only",
+  "main": "./dist/index.js",
+  "name": "@shorts-forge/pipeline",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test 'dist/test/*.test.js'",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "serve": "node dist/src/server.js",
+    "dev": "npm run build && npm run serve"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "version": "0.1.0"
+}

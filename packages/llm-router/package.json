@@ -1,0 +1,17 @@
+{
+  "description": "Cliente LLM compatível com a API OpenAI, com cadeia de fornecedores ordenada por prioridade e failover automático",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "AGPL-3.0-only",
+  "main": "dist/src/index.js",
+  "name": "@shorts-forge/llm-router",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test 'dist/test/*.test.js'"
+  },
+  "types": "dist/src/index.d.ts",
+  "version": "0.1.0"
+}
