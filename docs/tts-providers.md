@@ -33,7 +33,9 @@ Regras que não mudam:
   portuguesas são `pf_dora`, `pm_alex`, `pm_santa` — todas pt-BR). Para
   sotaque europeu genuíno, a omissão pt-PT é `edge-tts`
   (`pt-PT-DuarteNeural`/`pt-PT-RaquelNeural`). Tem voz francesa
-  (`ff_siwis` — única) e inglesas (`af_heart` = omissão en, `af_bella`,
+  (`ff_siwis` — única, mas **rejeitada** como omissão fr pela Joana em
+  2026-10-06: robótica, sotaque misto; fica só como último fallback
+  local) e inglesas (`af_heart` = omissão en, `af_bella`,
   `am_adam`, …) — ver o catálogo e [docs/i18n.md](./i18n.md).
 - Word timestamps via re-temporização faster-whisper sobre o áudio gerado
   (confirmado na Fase 2; o `KPipeline` não devolve timestamps nativos).
@@ -161,7 +163,38 @@ Se os timepoints vierem incompletos ou ausentes (há registo histórico de marca
   env > omissão do catálogo para o idioma do job
   (`packages/pipeline/src/voiceCatalog.ts::resolveTtsForJob`).
 - Omissões: pt-PT → `edge-tts/pt-PT-DuarteNeural`; pt-BR →
-  `kokoro/pf_dora`; en → `kokoro/af_heart`; fr → `kokoro/ff_siwis`
-  (única voz francesa do Kokoro-82M; `fr-FR-DeniseNeural` é a candidata
-  Edge-TTS por verificar).
+  `kokoro/pf_dora`; en → `kokoro/af_heart`; fr →
+  `edge-tts/fr-FR-DeniseNeural` (decisão da Joana de ouvido, 2026-10-06 —
+  a `ff_siwis` do Kokoro foi rejeitada por ser robótica e misturar
+  sotaques; fica só como último fallback local).
 - Detalhes, racional e checklist de verificação manual: [docs/i18n.md](./i18n.md).
+
+## 8. Princípio: naturalidade da voz primeiro (Joana, 2026-10-06) ⭐
+
+**O áudio gerado NÃO pode soar robótico.** A naturalidade da voz é o
+critério nº 1 na escolha de vozes e providers — acima da preferência por
+local/offline:
+
+- Vozes neurais (**Edge-TTS Neural**, **Google WaveNet/Neural2**) têm
+  prioridade mesmo exigindo rede (são grátis e sem chave no caso do
+  Edge-TTS; o Google tem tier grátis generoso — o **free-only**
+  mantém-se: nada pago no caminho crítico).
+- O modo 100% local (Kokoro) passa a ser **alternativa de robustez** —
+  continua no fim das cadeias de fallback para o pipeline funcionar
+  offline — mas já não é a omissão quando há conflito com a naturalidade.
+
+**Aplicações diretas já feitas:**
+
+- **Francês:** a `ff_siwis` (Kokoro) foi rejeitada pela Joana de ouvido
+  (robótica, mistura sotaque pt com francês) → omissão fr =
+  `edge-tts`/`fr-FR-DeniseNeural`, que exige rede. Exceção deliberada e
+  consciente ao princípio anterior da Fase 3 ("omissão não exige rede").
+- **pt-PT:** cadeia reordenada para `DuarteNeural → RaquelNeural →
+  google/pt-PT-Neural2-A → kokoro/pf_dora` — uma voz pt-BR nunca precede
+  uma neural pt-PT nativa sob este princípio; a `pf_dora` fica como
+  último recurso offline.
+- **Inglês (pendente de ouvido):** o default continua `kokoro/af_heart`
+  (a Joana nunca o rejeitou e o Kokoro tem boa qualidade), mas sob este
+  princípio é candidato a teste A/B por ouvido (`af_heart` vs
+  `en-US-AriaNeural`, Edge-TTS). **Não mudar o default sem ela ouvir** —
+  ver checklist em [docs/i18n.md](./i18n.md) §4.

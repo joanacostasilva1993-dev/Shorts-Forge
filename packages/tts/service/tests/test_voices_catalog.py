@@ -47,6 +47,18 @@ def test_language_default_unknown_returns_none():
     assert language_default_voice("watson", "fr") is None
 
 
+def test_french_language_default_is_denise_neural():
+    """Decisão da Joana (2026-10-06): a ff_siwis do Kokoro foi rejeitada
+    (robótica, mistura sotaque pt com francês). A omissão do idioma é
+    Edge-TTS fr-FR-DeniseNeural; ff_siwis fica só como fallback local."""
+    fr = next(l for l in load_catalog()["languages"] if l["tag"] == "fr")
+    assert fr["defaultProvider"] == "edge-tts"
+    assert fr["defaultVoice"] == "fr-FR-DeniseNeural"
+    assert fr["fallbackChain"][0] == {"provider": "edge-tts", "voice": "fr-FR-DeniseNeural"}
+    kokoro_fallbacks = [c for c in fr["fallbackChain"] if c["provider"] == "kokoro"]
+    assert kokoro_fallbacks == [{"provider": "kokoro", "voice": "ff_siwis"}]
+
+
 def test_each_language_has_default_and_fallback_chain():
     catalog = load_catalog()
     assert catalog["version"] == 1

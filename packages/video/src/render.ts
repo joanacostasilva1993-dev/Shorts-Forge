@@ -23,7 +23,7 @@
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { Segment, Spec, VideoFormat } from '@shorts-forge/shared';
+import type { Segment, Spec, VideoFormat, PlatformPresetId, SafeArea } from '@shorts-forge/shared';
 import { buildFrameDescriptor, type FrameDescriptor } from './frames.js';
 import {
   buildCompositionHtml,
@@ -33,11 +33,36 @@ import {
   type RenderFramesOptions,
 } from './hyperframesAdapter.js';
 import { getTemplate, type BrandTemplate } from './templates.js';
+import { getPreset } from './presets.js';
 import { assembleJob, type AssembleJobInput } from './ffmpeg.js';
 
 /** Canvas per output format. */
 export function canvasFor(format: VideoFormat): { width: number; height: number } {
   return format === '9:16' ? { width: 1080, height: 1920 } : { width: 1920, height: 1080 };
+}
+
+/** Canvas per platform preset. */
+export function canvasForPreset(preset: PlatformPresetId): { width: number; height: number } {
+  const p = getPreset(preset);
+  return { width: p.width, height: p.height };
+}
+
+/**
+ * Resolves the effective render target from `preset`/`format` options.
+ * A given `preset` wins and implies its own format; otherwise the
+ * explicit (or default) format drives the canvas with no safe area.
+ */
+export function renderTargetFor(opts: {
+  preset?: PlatformPresetId | undefined;
+  format?: VideoFormat | undefined;
+}): { width: number; height: number; format: VideoFormat; safeArea: SafeArea | undefined } {
+  if (opts.preset !== undefined) {
+    const p = getPreset(opts.preset);
+    return { width: p.width, height: p.height, format: p.format, safeArea: p.safeArea };
+  }
+  const format = opts.format ?? '9:16';
+  const { width, height } = canvasFor(format);
+  return { width, height, format, safeArea: undefined };
 }
 
 /** Low-res canvas for fast previews. */
@@ -114,8 +139,14 @@ export interface SegmentRenderOptions {
   outDir: string;
   /** BrandTemplate or template id. Defaults to 'bold-social'. */
   template?: BrandTemplate | string | undefined;
-  /** Output aspect. Defaults to '9:16'. */
+  /** Output aspect. Defaults to '9:16'. Ignored when `preset` is given (preset wins). */
   format?: VideoFormat | undefined;
+  /**
+   * Platform preset (e.g. 'tiktok'). When given it implies the format,
+   * drives the canvas resolution, applies the preset's caption safe area
+   * and (in renderJobVideo) its loudness target.
+   */
+  preset?: PlatformPresetId | undefined;
   /** Frame rate. Defaults to 30. */
   fps?: number | undefined;
   /** Working dir for Hyperframes temp files (keep off small tmpfs mounts). */
@@ -149,10 +180,12 @@ export async function renderSegmentClip(
   opts: SegmentRenderOptions & { outPath?: string },
 ): Promise<string> {
   const template = resolveTemplate(opts.template);
-  const format = opts.format ?? '9:16';
-  const { width, height } = canvasFor(format);
+  const target = renderTargetFor(opts);
+  const { width, height, safeArea } = target;
   const fps = opts.fps ?? 30;
-  const html = buildSegmentComposition(segment, template, { width, height, fps });
+  const compOpts: CompositionOptions = { width, height, fps };
+  if (safeArea) compOpts.safeArea = safeArea;
+  const html = buildSegmentComposition(segment, template, compOpts);
 
   const outPath = resolve(opts.outPath ?? join(resolve(opts.outDir), `${segment.id}.mp4`));
   const outDir = dirname(outPath);
@@ -218,8 +251,14 @@ export async function renderJobSegments(
 export interface PreviewRenderOptions {
   /** BrandTemplate or template id. Defaults to 'bold-social'. */
   template?: BrandTemplate | string | undefined;
-  /** Output aspect. Defaults to '9:16'. */
+  /** Output aspect. Defaults to '9:16'. Ignored when `preset` is given (preset wins). */
   format?: VideoFormat | undefined;
+  /**
+   * Platform preset (e.g. 'tiktok'). When given it implies the format,
+   * drives the canvas resolution and applies the preset's caption safe
+   * area to the preview.
+   */
+  preset?: PlatformPresetId | undefined;
   /** Frame rate. Defaults to 30. */
   fps?: number | undefined;
   /** Timeout for the render CLI in ms. Defaults to 5 minutes. */
@@ -243,7 +282,8 @@ export async function renderPreviewMp4(
   opts: PreviewRenderOptions = {},
 ): Promise<string> {
   const template = resolveTemplate(opts.template);
-  const format = opts.format ?? '9:16';
+  const target = renderTargetFor(opts);
+  const format = target.format;
   const { width, height } = previewCanvasFor(format);
   const fps = opts.fps ?? 30;
   const abs = resolve(outPath);
@@ -252,12 +292,14 @@ export async function renderPreviewMp4(
 
   const frames = spec.segments.map((segment) => buildSegmentFrame(segment, template));
   if (frames.length === 0) throw new Error('renderPreviewMp4: a Spec não tem segmentos.');
-  const html = buildCompositionHtml(frames, template, {
+  const compOpts: CompositionOptions = {
     width,
     height,
     fps,
     compositionId: 'sf-preview',
-  });
+  };
+  if (target.safeArea) compOpts.safeArea = target.safeArea;
+  const html = buildCompositionHtml(frames, template, compOpts);
 
   if (opts.lint !== false) {
     const gate: LintGate = typeof opts.lint === 'function' ? opts.lint : lintCompositionHtml;
@@ -290,8 +332,14 @@ export async function renderPreviewMp4(
 export interface JobVideoOptions {
   /** Per-job outputs dir: clips → `<outDir>/segments/`, final → `<outDir>/final.mp4`. */
   outDir: string;
-  /** Output aspect. Defaults to '9:16'. */
+  /** Output aspect. Defaults to '9:16'. Ignored when `preset` is given (preset wins). */
   format?: VideoFormat | undefined;
+  /**
+   * Platform preset (e.g. 'tiktok'). When given it implies the format,
+   * drives the canvas resolution, applies the preset's caption safe area
+   * and its loudness target in the final assembly.
+   */
+  preset?: PlatformPresetId | undefined;
   /** BrandTemplate or template id. Defaults to 'bold-social'. */
   template?: BrandTemplate | string | undefined;
   /** Optional background music track (ducked under narration). */
@@ -309,20 +357,24 @@ export interface JobVideoOptions {
  * `<outDir>/final.mp4`.
  */
 export async function renderJobVideo(spec: Spec, opts: JobVideoOptions): Promise<string> {
-  const format = opts.format ?? '9:16';
+  const target = renderTargetFor(opts);
+  const format = target.format;
+  const preset = opts.preset !== undefined ? getPreset(opts.preset) : undefined;
   const outDir = resolve(opts.outDir);
   const total = spec.segments.length;
   if (total === 0) throw new Error('renderJobVideo: a Spec não tem segmentos.');
 
   opts.onProgress?.(0, total, 'A renderizar os segmentos do vídeo…');
-  const clips = await renderJobSegments(spec, {
+  const segmentOpts: SegmentRenderOptions = {
     outDir: join(outDir, 'segments'),
-    template: opts.template,
     format,
     fps: opts.fps,
     onProgress: (done, totalSegs, segmentId) =>
       opts.onProgress?.(done, totalSegs, `Segmento ${done}/${totalSegs} renderizado (${segmentId}).`),
-  });
+  };
+  if (opts.template !== undefined) segmentOpts.template = opts.template;
+  if (opts.preset !== undefined) segmentOpts.preset = opts.preset;
+  const clips = await renderJobSegments(spec, segmentOpts);
 
   opts.onProgress?.(total, total, 'A montar o vídeo final (FFmpeg)…');
   const assembleInput: AssembleJobInput = {
@@ -334,6 +386,7 @@ export async function renderJobVideo(spec: Spec, opts: JobVideoOptions): Promise
     onProgress: (message) => opts.onProgress?.(total, total, message),
   };
   if (opts.musicPath) assembleInput.musicPath = opts.musicPath;
+  if (preset) assembleInput.loudnessLufs = preset.loudnessLufs;
   return assembleJob(assembleInput);
 }
 
@@ -343,9 +396,15 @@ export async function renderJobVideo(spec: Spec, opts: JobVideoOptions): Promise
  */
 export interface VideoRenderer {
   /** Renders the spec (already re-timed) to the final MP4. Returns outPath. */
-  render(spec: Spec, opts: { outPath: string; template?: BrandTemplate | string }): Promise<string>;
+  render(
+    spec: Spec,
+    opts: { outPath: string; template?: BrandTemplate | string; preset?: PlatformPresetId },
+  ): Promise<string>;
   /** Fast low-res preview MP4 of the spec. Returns outPath. */
-  preview(spec: Spec, opts: { outPath: string; template?: BrandTemplate | string }): Promise<string>;
+  preview(
+    spec: Spec,
+    opts: { outPath: string; template?: BrandTemplate | string; preset?: PlatformPresetId },
+  ): Promise<string>;
 }
 
 /** Default `VideoRenderer`: per-segment Hyperframes + FFmpeg assembly. */
@@ -353,17 +412,18 @@ export function createVideoRenderer(format: VideoFormat = '9:16'): VideoRenderer
   return {
     render: async (spec, opts) => {
       const outDir = dirname(resolve(opts.outPath));
-      const finalPath = await renderJobVideo(spec, {
-        outDir,
-        format,
-        template: opts.template,
-      });
+      const renderOpts: JobVideoOptions = { outDir, format, template: opts.template };
+      if (opts.preset !== undefined) renderOpts.preset = opts.preset;
+      const finalPath = await renderJobVideo(spec, renderOpts);
       if (resolve(finalPath) !== resolve(opts.outPath)) {
         copyFileSync(finalPath, resolve(opts.outPath));
       }
       return resolve(opts.outPath);
     },
-    preview: async (spec, opts) =>
-      renderPreviewMp4(spec, opts.outPath, { format, template: opts.template }),
+    preview: async (spec, opts) => {
+      const previewOpts: PreviewRenderOptions = { format, template: opts.template };
+      if (opts.preset !== undefined) previewOpts.preset = opts.preset;
+      return renderPreviewMp4(spec, opts.outPath, previewOpts);
+    },
   };
 }

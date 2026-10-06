@@ -17,8 +17,11 @@
  * Phase B (this phase's scope): per-segment TTS via `ServiceClients` with
  * REAL word timestamps, then `retimeSpec()` (pure, existing), then the real
  * video render — per-segment Hyperframes clips + FFmpeg assembly via
- * `@shorts-forge/video` — and the job finishes `done` with `outputPath`
- * pointing at `outputs/<jobId>/final.mp4`, so `/download` serves it.
+ * `@shorts-forge/video` — then the automatic QC stage (`qc.ts`): the job
+ * only reaches `done` (with `outputPath` pointing at
+ * `outputs/<jobId>/final.mp4`) when every quality check passes; a failed
+ * QC moves it to `qc-failed` with pt-PT reasons, and `/download` refuses
+ * to serve it. `retryQc()` re-runs only the QC stage.
  *
  * The video step is injectable (`OrchestratorDeps.renderVideo`) so tests
  * can substitute a fast double; the default is the real implementation.
@@ -32,12 +35,14 @@
 
 import type {
   PipelineInput,
+  PlatformPresetId,
+  ShortClipStrategy,
   Spec,
   TranscriptionResult,
   TtsResult,
   VideoFormat,
 } from '@shorts-forge/shared';
-import { renderJobVideo, resolveBrollForSegments } from '@shorts-forge/video';
+import { renderJobVideo, resolveBrollForSegments, resolvePreset } from '@shorts-forge/video';
 import {
   generateSpec as generateSpecViaLlm,
   validateSpecJson,
@@ -51,6 +56,16 @@ import { ApiError, Job, JobEvent, JobStore, type JobTtsChoice } from './jobs.js'
 import type { ServiceManager } from './services.js';
 import { getLanguageEntry, resolveTtsForJob } from './voiceCatalog.js';
 import { jobOutputsDir, outputsRoot } from './outputs.js';
+import {
+  QC_CAPTION_FILENAME,
+  formatQcFailurePt,
+  formatQcWarningsPt,
+  runQc,
+  writeCaptionsSrt,
+  writeQcReport,
+  type QcReport,
+} from './qc.js';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -64,6 +79,8 @@ export type RenderVideoFn = (
   opts: {
     jobId: string;
     format: VideoFormat;
+    /** Platform preset; when given it implies the format and drives canvas/safe-area/loudness. */
+    preset?: PlatformPresetId;
     outDir: string;
     onProgress: (done: number, total: number, message: string) => void;
   },
@@ -72,20 +89,40 @@ export type RenderVideoFn = (
 /** Default RenderVideoFn: the real per-segment render + assembly. */
 export async function defaultRenderVideo(
   spec: Spec,
-  opts: { jobId: string; format: VideoFormat; outDir: string; onProgress: (done: number, total: number, message: string) => void },
+  opts: {
+    jobId: string;
+    format: VideoFormat;
+    preset?: PlatformPresetId;
+    outDir: string;
+    onProgress: (done: number, total: number, message: string) => void;
+  },
 ): Promise<string> {
-  return renderJobVideo(spec, {
+  const renderOpts: Parameters<typeof renderJobVideo>[1] = {
     outDir: opts.outDir,
     format: opts.format,
     onProgress: opts.onProgress,
-  });
+  };
+  if (opts.preset !== undefined) renderOpts.preset = opts.preset;
+  return renderJobVideo(spec, renderOpts);
 }
 
 /** The Pipeline interface (ARCHITECTURE.md §4.3). */
 export interface Pipeline {
   createJob(
     input: PipelineInput,
-    opts: { format: VideoFormat; language: string; ttsChoice?: JobTtsChoice },
+    opts: {
+      format: VideoFormat;
+      language: string;
+      ttsChoice?: JobTtsChoice;
+      /** Platform preset (TikTok, YouTube Shorts, …). When given it wins over `format`. */
+      preset?: PlatformPresetId;
+      /**
+       * Per-project short-clip strategy for B-roll ('loop' = smooth loop
+       * with crossfade, the default; 'freeze' = hold the last frame).
+       * Absent → the B-roll resolver defaults to 'loop'.
+       */
+      shortClipStrategy?: ShortClipStrategy;
+    },
   ): Promise<Job>;
   /** Fase A: audio → transcribe (+cache) → LLM → strict validate → store. */
   generateSpec(jobId: string): Promise<Spec>;
@@ -93,6 +130,12 @@ export interface Pipeline {
   approveSpec(jobId: string, spec: Spec): Promise<Job>;
   /** Fase B: kicks off async; returns the job with status `rendering`. */
   render(jobId: string): Promise<Job>;
+  /**
+   * Re-runs ONLY the QC stage against the existing `final.mp4` of a
+   * `qc-failed` job (e.g. the video file was fixed externally, or a QC
+   * check misfired). Kicks off async; returns the job with status `qc`.
+   */
+  retryQc(jobId: string): Promise<Job>;
   getJob(jobId: string): Promise<Job>;
   /** Event stream for SSE. */
   specEvents(jobId: string): AsyncIterable<JobEvent>;
@@ -148,12 +191,36 @@ export class PipelineOrchestrator implements Pipeline {
 
   async createJob(
     input: PipelineInput,
-    opts: { format: VideoFormat; language: string; ttsChoice?: JobTtsChoice },
+    opts: {
+      format: VideoFormat;
+      language: string;
+      ttsChoice?: JobTtsChoice;
+      preset?: PlatformPresetId;
+      shortClipStrategy?: ShortClipStrategy;
+    },
   ): Promise<Job> {
     validateInput(input);
-    const format = validateFormat(opts.format);
+    const requestedFormat = validateFormat(opts.format);
     const language = validateLanguage(opts.language);
-    return this.store.create(input, format, language, opts.ttsChoice);
+    const shortClipStrategy = validateShortClipStrategy(opts.shortClipStrategy);
+    // Precedence (docs/platforms.md): an explicit preset wins over
+    // `format` and implies its own format. Without a preset, the format
+    // maps to that aspect's default preset (9:16 → YouTube Shorts,
+    // 16:9 → YouTube long-form).
+    let preset;
+    try {
+      preset = resolvePreset(opts.preset ?? null, requestedFormat);
+    } catch (err) {
+      throw new ApiError('invalid_input', 400, errMsg(err));
+    }
+    return this.store.create(
+      input,
+      preset.format,
+      language,
+      opts.ttsChoice,
+      preset.id,
+      shortClipStrategy,
+    );
   }
 
   async generateSpec(jobId: string): Promise<Spec> {
@@ -236,18 +303,67 @@ export class PipelineOrchestrator implements Pipeline {
         'Gera e aprova a Spec antes de renderizar (Fase A primeiro).',
       );
     }
-    if (job.status !== 'awaiting-approval') {
+    if (job.status !== 'awaiting-approval' && job.status !== 'qc-failed') {
       throw new ApiError(
         'invalid_state',
         409,
-        `Só é possível renderizar um job com a Spec aprovada (estado atual: "${job.status}").`,
+        `Só é possível renderizar um job com a Spec aprovada ou que tenha chumbado no QC (estado atual: "${job.status}").`,
       );
     }
     this.inFlight.add(jobId);
-    const started = this.store.update(jobId, { status: 'rendering', progress: 0 });
+    // Re-render from qc-failed clears the previous failure state and the
+    // (rejected) video, so /download can never serve it afterwards.
+    const started = this.store.update(jobId, {
+      status: 'rendering',
+      progress: 0,
+      error: undefined,
+      outputPath: undefined,
+    });
     this.store.emit(jobId, 'rendering', 'A iniciar a Fase B: TTS por segmento…');
     // Phase B runs detached; completion/failure arrives via events.
     void this.runPhaseB(jobId).finally(() => this.inFlight.delete(jobId));
+    return started;
+  }
+
+  async retryQc(jobId: string): Promise<Job> {
+    const job = this.store.get(jobId);
+    if (this.inFlight.has(jobId)) {
+      throw new ApiError(
+        'already_running',
+        409,
+        'Este job já tem uma operação em curso — aguarda que termine.',
+      );
+    }
+    if (job.status !== 'qc-failed') {
+      throw new ApiError(
+        'invalid_state',
+        409,
+        `Só é possível repetir o QC de um job em "qc-failed" (estado atual: "${job.status}").`,
+      );
+    }
+    if (!job.spec) {
+      throw new ApiError(
+        'spec_missing',
+        409,
+        'O job perdeu a Spec — já não é possível repetir o QC.',
+      );
+    }
+    if (!job.outputPath || !existsSync(job.outputPath)) {
+      throw new ApiError(
+        'video_not_ready',
+        409,
+        'O vídeo final desapareceu do disco — volta a correr o render.',
+      );
+    }
+    this.inFlight.add(jobId);
+    const started = this.store.update(jobId, {
+      status: 'qc',
+      error: undefined,
+      progress: 0.95,
+    });
+    this.store.emit(jobId, 'qc', 'A repetir o controlo de qualidade…');
+    // QC re-run is detached; the outcome arrives via events.
+    void this.runQcStage(jobId).finally(() => this.inFlight.delete(jobId));
     return started;
   }
 
@@ -263,7 +379,9 @@ export class PipelineOrchestrator implements Pipeline {
     let terminal = false;
     const unsubscribe = this.store.subscribe(jobId, (event) => {
       queue.push(event);
-      if (event.type === 'done' || event.type === 'failed') terminal = true;
+      if (event.type === 'done' || event.type === 'failed' || event.type === 'qc-failed') {
+        terminal = true;
+      }
       if (wake) {
         const w = wake;
         wake = null;
@@ -401,6 +519,7 @@ export class PipelineOrchestrator implements Pipeline {
         format: job.format,
         cacheDir: join(outputsRoot(), 'cache', 'broll'),
         projectDir: jobOutputsDir(jobId),
+        shortClipStrategy: job.shortClipStrategy,
         log: (message) => this.store.emit(jobId, 'progress', message),
       });
 
@@ -412,6 +531,7 @@ export class PipelineOrchestrator implements Pipeline {
       const finalPath = await this.renderVideo(retimed, {
         jobId,
         format: job.format,
+        preset: job.preset,
         outDir,
         onProgress: (done, totalSegs, message) => {
           const progress = 0.8 + (0.2 * done) / Math.max(1, totalSegs);
@@ -420,8 +540,13 @@ export class PipelineOrchestrator implements Pipeline {
         },
       });
 
-      this.store.update(jobId, { outputPath: finalPath, progress: 1, status: 'done' });
-      this.store.emit(jobId, 'done', 'Vídeo final pronto.');
+      // ── Captions sidecar: the QC stage checks it against the spec ──
+      const captionPath = join(outDir, QC_CAPTION_FILENAME);
+      writeCaptionsSrt(retimed, captionPath);
+
+      // ── QC stage (automatic): analyse the final MP4 before `done` ──
+      this.store.update(jobId, { outputPath: finalPath });
+      await this.runQcStage(jobId);
     } catch (err) {
       const api =
         err instanceof ApiError
@@ -429,6 +554,58 @@ export class PipelineOrchestrator implements Pipeline {
           : new ApiError('render_failed', 500, `Falha na Fase B: ${errMsg(err)}`);
       this.store.fail(jobId, api.message);
       this.store.emit(jobId, 'failed', api.message);
+    }
+  }
+
+  /**
+   * Runs the automatic QC stage for a job whose `outputPath` and `spec`
+   * are already set. Writes `outputs/<jobId>/qc-report.json`, then moves
+   * the job to `done` (all checks passed) or `qc-failed` (pt-PT reasons
+   * in `job.error`). Never throws for content failures — only for
+   * missing inputs (which become an honest `failed` via the caller).
+   */
+  private async runQcStage(jobId: string): Promise<void> {
+    const job = this.store.get(jobId);
+    const spec = job.spec;
+    const videoPath = job.outputPath;
+    if (!spec) throw new Error('a Spec desapareceu antes do QC');
+    if (!videoPath) throw new Error('o vídeo final desapareceu antes do QC');
+
+    this.store.update(jobId, { status: 'qc', progress: 0.95 });
+    this.store.emit(jobId, 'qc', 'A verificar a qualidade do vídeo final…');
+
+    // A config de TTS é determinística para o job — resolve-se de novo para
+    // a rastreabilidade do relatório ("este render usou que voz?").
+    const ttsConfig = resolveTtsForJob({
+      language: job.language,
+      engine: job.ttsChoice?.engine,
+      voice: job.ttsChoice?.voice,
+    });
+
+    const outDir = jobOutputsDir(jobId);
+    const report: QcReport = await runQc({
+      jobId,
+      videoPath,
+      spec,
+      captionPath: join(outDir, QC_CAPTION_FILENAME),
+      tts: { provider: ttsConfig.provider, voice: ttsConfig.voice, rate: ttsConfig.rate },
+    });
+    writeQcReport(outDir, report);
+
+    if (report.passed) {
+      this.store.update(jobId, { progress: 1, status: 'done' });
+      const warnings = formatQcWarningsPt(report);
+      this.store.emit(
+        jobId,
+        'done',
+        warnings
+          ? `Vídeo final pronto — passou no controlo de qualidade. ${warnings}`
+          : 'Vídeo final pronto — passou no controlo de qualidade.',
+      );
+    } else {
+      const reasons = formatQcFailurePt(report);
+      this.store.update(jobId, { progress: 0.95, status: 'qc-failed', error: reasons });
+      this.store.emit(jobId, 'qc-failed', reasons);
     }
   }
 
@@ -486,6 +663,22 @@ function validateLanguage(language: unknown): string {
   // Throws ApiError(400, unsupported_language) for unknown tags — the
   // catalog (packages/tts/voices.catalog.json) is the authority.
   return getLanguageEntry(language).tag;
+}
+
+/**
+ * Validates the per-project short-clip strategy (ARCHITECTURE.md §7:
+ * 'loop' = smooth loop with crossfade is the default; 'freeze' holds
+ * the last frame). Absent → undefined (the B-roll resolver defaults to
+ * 'loop'); anything else → 400.
+ */
+function validateShortClipStrategy(value: unknown): ShortClipStrategy | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (value === 'loop' || value === 'freeze') return value;
+  throw new ApiError(
+    'invalid_input',
+    400,
+    'O campo "shortClipStrategy" tem de ser "loop" ou "freeze".',
+  );
 }
 
 function toPhaseAFailure(err: unknown): ApiError {

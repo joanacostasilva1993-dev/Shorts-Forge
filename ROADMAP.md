@@ -87,15 +87,21 @@ fallbacks; narração em 4 idiomas.
   `renderFrames()` por segmento (adaptador já verificado na Fase 1);
   `lintCompositionHtml` como gate
 - [x] B-roll: cascata real `Pexels → Pixabay → Ken Burns local →
-  fundo gerado` (`packages/video/src/broll.ts`) — **23/23 testes verdes**
+  fundo gerado` (`packages/video/src/broll.ts`) — **45/45 testes verdes**
   com HTTP mockado (ordem da cascata, never-empty, cache por `clipId`,
   registo no-repeat por projeto em `broll-registry.json`,
-  `orientation=portrait` para 9:16); testes LIVE honestos saltam sem chaves
+  `orientation=portrait` para 9:16); scoring v2 com sinónimos (ver
+  `docs/broll.md`); pesquisa multi-query por segmento; clips curtos
+  estendidos com FFmpeg — **loop suave com crossfade por omissão**,
+  `freeze` opt-in por projeto (`shortClipStrategy`); testes LIVE honestos
+  saltam sem chaves
 - [x] i18n: `packages/tts/voices.catalog.json` (fonte única de verdade) +
   `pipeline/src/voiceCatalog.ts` + `ui/src/lib/voices.ts` + **seletor de
   idioma na UI** (`StepInput`) e voice picker (`StepVoice`); 4 idiomas:
   pt-PT (edge-tts `pt-PT-DuarteNeural`), pt-BR (kokoro `pf_dora`),
-  en (kokoro `af_heart`), fr (kokoro `ff_siwis`) — 17 testes de contrato
+  en (kokoro `af_heart`), fr (edge-tts `fr-FR-DeniseNeural` — decisão da
+  Joana de ouvido, 2026-10-06; a `ff_siwis` do Kokoro foi rejeitada e é só
+  o último fallback local) — 17 testes de contrato
   verdes; orçamentos de legendas por idioma (`getCaptionBudget`,
   `wrapCaptionLines` — 8 testes verdes)
 - [x] `pipeline`: `GET /api/jobs/:id/download` serve o MP4 real (200 com
@@ -126,35 +132,70 @@ confirmar.
 > de "Fora de âmbito" — a Fase 3 entrega pt-PT, pt-BR, inglês e francês
 > (decisão da Joana, 2026-10-06; o ROADMAP antigo ficou para trás).
 
-## Fase 4 — Montagem + QC (assemble real + quality-review)
+## Fase 4 — Montagem + QC (assemble real + quality-review) ✅ concluída
 
 **Objetivo:** MP4 final com B-roll real, verificado automaticamente.
 
-**O que a Fase 3 já entregou** (não repetir): resolução de B-roll por
-segmento com cascata Pexels → Pixabay → Ken Burns → template, cache por
-`clipId` em `outputs/cache/broll/`, registo no-repeat por projeto,
-`orientation=portrait` para 9:16 e scoring por relevância/duração/
-orientação. O que falta aqui é **afinação**, não construção.
+**Estado verificado em 2026-10-06** (QA: testado contra o que corre, não
+contra planos):
 
-- **Afinação semântica do B-roll**: melhorar o scoring com os dados reais
-  das pesquisas (a heurística atual usa overlap de keywords/tags; validar
-  com pesquisas reais e ajustar pesos); `buildAssembleArgs()` já testado
-- `video.assemble()` **real**: `renderFrames()` por segmento →
-  concatenação com as faixas de narração TTS (spawn do FFmpeg com
-  `buildAssembleArgs()`); o stub atual lança honestamente
-- `GET /api/jobs/:id/preview` real (baixa resolução) ligado à UI
-- **QC automático pós-render** (ideia adotada do OpenMontage): etapa `qc`
-  entre render e `done` — duração vs soma de `actualDurationSec`, streams,
-  resolução, frames pretos (`blackdetect`), silêncio (`silencedetect`),
-  clipping (`astats`), legendas presentes, integridade (`ffprobe`);
-  estado `qc-failed` bloqueia o download até correção/aprovação manual
-- **Presets por plataforma** (TikTok/YouTube/Instagram) no `RenderOptions`
-- Validação ao vivo das pesquisas Pexels/Pixabay com chaves gratuitas
-  (os testes LIVE da Fase 3 saltam sem chaves)
+- [x] **Afinação semântica do B-roll** (`packages/video/src/broll.ts`):
+      scoring v2 (sinónimos/termos relacionados, stems ingénuos,
+      tokens do slug do page-URL; pesos 55/35/10 documentados),
+      pesquisa multi-query (`searchPexelsMulti`/`searchPixabayMulti` com
+      variantes e dedup por `clipId`), e **short-clip fit**:
+      `buildSmoothLoopArgs` (loop com crossfade via xfade, offsets
+      cumulativos) / `buildFreezeFrameArgs` (tpad) puros +
+      `fitShortClip` real (FFmpeg, cache determinístico
+      `fit-<strategy>-<clipId>-<T>s.mp4`) — **omissão `loop`** (crossfade
+      suave), configurável por projeto via `shortClipStrategy: 'freeze'`
+      (`POST /api/jobs`, validado, 400 senão); fit falhado → clip curto
+      honesto (never-empty). **45/45 testes verdes** (2 LIVE saltam sem
+      chaves)
+- [x] **QC automático pós-render** (`packages/pipeline/src/qc.ts`):
+      **9 checks reais** (ffprobe/filtros FFmpeg sobre o `final.mp4`,
+      fail-closed) — `audio-present`, `duration`, `captions`, `no-black`,
+      `no-freeze`, `loudness`, `no-clipping`, `no-unexpected-silence` e
+      `no-abrupt-cut` (este último só AVISO, nunca chumba); etapa `qc`
+      entre render e `done`, `qc-failed` com motivos pt-PT em
+      `job.error`; `/download` recusa `qc-failed` (409 `qc_failed`);
+      `qc-report.json` (`schema: 'shorts-forge/qc-report'`, v1) em
+      `outputs/<jobId>/`; `writeCaptionsSrt` (SRT a partir das words
+      reais do TTS); recuperação honesta: `POST …/retry-qc` (só QC) ou
+      `POST …/render` (Fase B completa, limpa o vídeo rejeitado).
+      Documentado em `ARCHITECTURE.md` §8.1. **16/16 testes verdes**
+      (fixtures FFmpeg geradas no teste, nunca binaries commitados) +
+      5 de ciclo de vida + 3 de rotas
+- [x] **Presets por plataforma** (`packages/video/src/presets.ts`):
+      TikTok / YouTube Shorts / YouTube longo / Instagram Reels
+      (resolução, duração máx., safe areas, loudness −14 LUFS, quirks
+      pt-PT); `resolvePreset` (preset explícito ganha ao `format`);
+      `renderTargetFor`/`canvasForPreset`; honra no render (canvas +
+      safe area das legendas + `loudnorm` a −14 com preset, −16 legado);
+      `POST /api/jobs { preset }` (400 em id desconhecido); UI com
+      seletor (`StepFormat`). Documentado em `docs/platforms.md`.
+      **20/20 testes de tabela + honra** (QA) + 6 de contrato API
+- [x] Regressões de integração da escrita paralela corrigidas pelo QA
+      (`exactOptionalPropertyTypes` em `jobs.ts`; `retryQc` no fake de
+      contrato) — `npm run typecheck` verde em todos os workspaces
+- [x] Voz francesa: decisão da Joana (2026-10-06) — `ff_siwis` (Kokoro)
+      **rejeitada** (robótica, sotaque misto); omissão fr passa a
+      `edge-tts`/`fr-FR-DeniseNeural` (exceção deliberada ao princípio
+      "omissão não exige rede": naturalidade = critério nº 1); catálogo,
+      testes e docs atualizados (ver `TEST_PLAN.md` §16.5)
+- [ ] Validação ao vivo: pesquisas Pexels/Pixabay reais (testes LIVE
+      saltam sem chaves); nomes Edge-TTS `verified: false` por confirmar
+      no PC da Joana (`verify_voices.py` + amostras fr para ela ouvir)
 
-**Done:** MP4 9:16 de 30–60 s com B-roll, legendas e áudio, gerado
-end-to-end sem intervenção após aprovação da Spec, com relatório QC
-verde.
+**Done:** MP4 9:16 com B-roll, legendas e áudio, gerado end-to-end com
+relatório QC verde; vídeo partido chumba o QC com motivos em pt-PT e
+nunca é servido.
+
+**Risco aberto (medição do QA):** o QC mede loudness a −16±2 LUFS mas os
+presets rendem a −14 — um `loudnorm` limpo a −14 mediu −14,03 LUFS
+(integrado), ou seja **0,03 LU de margem** até ao teto do check. Um vídeo
+bom de preset pode chumbar por margem. Recomendação: tornar o alvo de
+loudness do QC preset-aware (ou alargar a tolerância).
 
 ## Fase 5 — Produto (UI ligada + packaging)
 

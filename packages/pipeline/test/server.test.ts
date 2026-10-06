@@ -38,7 +38,7 @@ function validSpec(): Spec {
 function fakePipeline(): { pipeline: Pipeline; store: JobStore } {
   const store = new JobStore();
   const pipeline: Pipeline = {
-    createJob: async (input, opts) => store.create(input, opts.format, opts.language),
+    createJob: async (input, opts) => store.create(input, opts.format, opts.language, opts.ttsChoice, opts.preset, opts.shortClipStrategy),
     generateSpec: async (id) => {
       const job = store.get(id);
       const spec = validSpec();
@@ -59,6 +59,19 @@ function fakePipeline(): { pipeline: Pipeline; store: JobStore } {
     render: async (id) => {
       const updated = store.update(id, { status: 'rendering', progress: 0 });
       store.emit(id, 'rendering');
+      return updated;
+    },
+    retryQc: async (id) => {
+      const job = store.get(id);
+      if (job.status !== 'qc-failed') {
+        throw new ApiError(
+          'invalid_state',
+          409,
+          `Só é possível repetir o QC de um job em "qc-failed" (estado atual: "${job.status}").`,
+        );
+      }
+      const updated = store.update(id, { status: 'qc', error: undefined, progress: 0.95 });
+      store.emit(id, 'qc');
       return updated;
     },
     getJob: async (id) => store.get(id),
@@ -225,6 +238,27 @@ describe('jobs', () => {
     assert.match(json.error.message, /input/);
   });
 
+  it("POST /api/jobs com shortClipStrategy 'freeze' → guardado no job", async () => {
+    const { status, json } = await post('/jobs', {
+      input: { kind: 'topic', topic: 't' },
+      format: '9:16',
+      language: 'pt-PT',
+      shortClipStrategy: 'freeze',
+    });
+    assert.equal(status, 201);
+    assert.equal((json.job as Job).shortClipStrategy, 'freeze');
+  });
+
+  it("POST /api/jobs com shortClipStrategy inválido → 400 invalid_input", async () => {
+    const { status, json } = await post('/jobs', {
+      input: { kind: 'topic', topic: 't' },
+      shortClipStrategy: 'stretch',
+    });
+    assert.equal(status, 400);
+    assert.equal(json.error.code, 'invalid_input');
+    assert.match(json.error.message, /shortClipStrategy/);
+  });
+
   it('GET /api/jobs/:id → 200 { job }; desconhecido → 404', async () => {
     const created = await post('/jobs', { input: { kind: 'topic', topic: 't' } });
     const id = (created.json.job as Job).id;
@@ -362,6 +396,70 @@ describe('download / preview', () => {
   it('GET /api/jobs/:id/download de job desconhecido → 404', async () => {
     const { status } = await get('/jobs/job-que-nao-existe/download');
     assert.equal(status, 404);
+  });
+
+  it('GET /api/jobs/:id/download com qc-failed → 409 qc_failed (nunca serve vídeo mau)', async () => {
+    const job = store.create({ kind: 'topic', topic: 't' }, '9:16', 'pt-PT');
+    store.update(job.id, {
+      status: 'qc-failed',
+      error: 'O vídeo não passou no controlo de qualidade (1 de 6 verificações chumbaram).',
+      outputPath: fixtureMp4, // mesmo com MP4 em disco, não pode ser servido
+    });
+    const res = await fetch(`${base}/jobs/${job.id}/download`);
+    assert.equal(res.status, 409);
+    const json = (await res.json()) as { error: { code: string; message: string } };
+    assert.equal(json.error.code, 'qc_failed');
+    assert.match(json.error.message, /não passou no controlo de qualidade/);
+  });
+
+  it('GET /api/jobs/:id/qc-report sem relatório → 404', async () => {
+    const job = store.create({ kind: 'topic', topic: 't' }, '9:16', 'pt-PT');
+    const { status, json } = await get(`/jobs/${job.id}/qc-report`);
+    assert.equal(status, 404);
+    assert.equal(json.error.code, 'qc_report_not_found');
+  });
+
+  it('GET /api/jobs/:id/qc-report com relatório → 200 { report }', async () => {
+    const { mkdtempSync: mkTmp } = await import('node:fs');
+    const scratch = mkTmp(join(tmpdir(), 'sf-qcr-'));
+    process.env.SHORTS_FORGE_OUTPUTS_DIR = scratch;
+    try {
+      const job = store.create({ kind: 'topic', topic: 't' }, '9:16', 'pt-PT');
+      const { jobOutputsDir } = await import('../src/index.js');
+      const { mkdirSync, writeFileSync } = await import('node:fs');
+      const outDir = jobOutputsDir(job.id);
+      mkdirSync(outDir, { recursive: true });
+      writeFileSync(
+        join(outDir, 'qc-report.json'),
+        JSON.stringify({ schema: 'shorts-forge/qc-report', version: 1, passed: false, checks: [] }),
+        'utf8',
+      );
+      const { status, json } = await get(`/jobs/${job.id}/qc-report`);
+      assert.equal(status, 200);
+      assert.equal(json.report.schema, 'shorts-forge/qc-report');
+      assert.equal(json.report.passed, false);
+    } finally {
+      delete process.env.SHORTS_FORGE_OUTPUTS_DIR;
+      const { rmSync } = await import('node:fs');
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('POST /api/jobs/:id/retry-qc de job qc-failed → 202 (estado qc)', async () => {
+    const job = store.create({ kind: 'topic', topic: 't' }, '9:16', 'pt-PT');
+    store.update(job.id, { status: 'qc-failed', error: 'motivo' });
+    const res = await fetch(`${base}/jobs/${job.id}/retry-qc`, { method: 'POST' });
+    assert.equal(res.status, 202);
+    const json = (await res.json()) as { job: Job };
+    assert.equal(json.job.status, 'qc');
+  });
+
+  it('POST /api/jobs/:id/retry-qc fora de qc-failed → 409 invalid_state', async () => {
+    const job = store.create({ kind: 'topic', topic: 't' }, '9:16', 'pt-PT');
+    const res = await fetch(`${base}/jobs/${job.id}/retry-qc`, { method: 'POST' });
+    assert.equal(res.status, 409);
+    const json = (await res.json()) as { error: { code: string } };
+    assert.equal(json.error.code, 'invalid_state');
   });
 });
 

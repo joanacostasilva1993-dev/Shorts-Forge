@@ -16,6 +16,7 @@ import type {
   ChatRequest,
   ChatResult,
   PipelineInput,
+  PlatformPresetId,
   Spec,
   VideoFormat,
 } from '@shorts-forge/shared';
@@ -59,6 +60,13 @@ export interface ProviderStatus {
 export interface CreateJobOptions {
   format: VideoFormat;
   language: string;
+  /**
+   * Platform preset (tiktok, youtube-shorts, youtube-long,
+   * instagram-reels). Sent to POST /api/jobs; the server gives it
+   * precedence over `format` and resolves canvas, caption safe areas
+   * and loudness from it.
+   */
+  preset?: PlatformPresetId;
   /** Explicit per-job TTS choice (StepVoice); sent through to Phase B. */
   tts?: { engine?: string; voice?: string };
 }
@@ -100,6 +108,7 @@ export async function createJob(
     format: opts.format,
     language: opts.language,
   };
+  if (opts.preset) body['preset'] = opts.preset;
   if (opts.tts) body['tts'] = opts.tts;
   const { job } = await request<{ job: Job }>('/jobs', {
     method: 'POST',

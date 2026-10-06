@@ -1,7 +1,9 @@
 /**
  * Tests for the B-roll resolution module (packages/video/src/broll.ts).
  *
- * - scoring/selection: pure, fully deterministic;
+ * - scoring/selection: pure, fully deterministic (incl. the v2
+ *   synonym-aware relevance, page-slug tokens and multi-query merging);
+ * - short-clip fit: pure FFmpeg arg builders + real FFmpeg loop/freeze;
  * - no-repeat registry: in-memory + JSON persistence;
  * - cascade fallback order: HTTP layer mocked via injected fetchImpl;
  * - cache hit/miss: real files in a temp dir;
@@ -15,22 +17,29 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Segment } from '@shorts-forge/shared';
 import {
+  buildFreezeFrameArgs,
   buildGradientStillArgs,
   buildKenBurnsArgs,
+  buildQueryVariants,
   buildSearchQuery,
+  buildSmoothLoopArgs,
   buildTemplateClipArgs,
   cachePathFor,
   clipIdForKenBurns,
   downloadToCache,
   ensureKenBurnsClip,
   ffmpegAvailable,
+  fitShortClip,
   kenBurnsVariant,
   resolveBroll,
   resolveBrollForSegments,
   scoreCandidate,
   searchPexels,
+  searchPexelsMulti,
   searchPixabay,
+  searchPixabayMulti,
   selectBestCandidate,
+  tokensFromPageUrl,
   UsedClipRegistry,
   type BrollCandidate,
 } from '../broll.js';
@@ -161,11 +170,24 @@ function mockFetch(handler: (url: string) => { status: number; body: unknown } |
     const outcome = handler(url);
     if (outcome instanceof Error) throw outcome;
     const { status, body } = outcome;
-    const isJson = typeof body !== 'string' || body.startsWith('{');
-    const bytes = typeof body === 'string' && !isJson ? body : JSON.stringify(body);
-    return new Response(bytes, {
+    // Uint8Array (e.g. real MP4 bytes built by a test) is served raw as
+    // video/mp4; non-JSON strings are fake video bytes; anything else is
+    // JSON.
+    let payload: BodyInit;
+    let contentType: string;
+    if (body instanceof Uint8Array) {
+      payload = body as unknown as BodyInit;
+      contentType = 'video/mp4';
+    } else if (typeof body === 'string' && !body.startsWith('{')) {
+      payload = body;
+      contentType = 'video/mp4';
+    } else {
+      payload = JSON.stringify(body);
+      contentType = 'application/json';
+    }
+    return new Response(payload, {
       status,
-      headers: { 'content-type': isJson ? 'application/json' : 'video/mp4' },
+      headers: { 'content-type': contentType },
     });
   }) as typeof fetch;
 }
@@ -428,4 +450,362 @@ test('LIVE: Pixabay search returns real candidates', { skip: process.env.PIXABAY
   );
   assert.ok(cands.length > 0, 'Pixabay should return candidates for "sunrise city timelapse"');
   assert.ok(cands[0]?.url.startsWith('https://'), 'candidate must carry a direct file URL');
+});
+
+// ── scoring v2: synonym-aware relevance ──────────────────────────────
+
+test('scoreCandidate v2: synonym match outranks unrelated tags', () => {
+  const seg = segment({ visualKeywords: ['sunrise'], brollDescription: 'sunrise' });
+  const syn = candidate({ clipId: 's', tags: ['dawn', 'morning'] });
+  const unrelated = candidate({ clipId: 'u', tags: ['ocean', 'waves'] });
+  const sSyn = scoreCandidate(syn, seg, 5.2, '9:16');
+  const sUnrelated = scoreCandidate(unrelated, seg, 5.2, '9:16');
+  assert.ok(sSyn.relevance > 0, 'a synonym hit must score relevance > 0');
+  assert.equal(sUnrelated.relevance, 0);
+  assert.ok(sSyn.total > sUnrelated.total);
+});
+
+test('scoreCandidate v2: exact keyword still beats its synonym', () => {
+  const seg = segment({ visualKeywords: ['sunrise'], brollDescription: 'sunrise' });
+  const exact = candidate({ clipId: 'e', tags: ['sunrise'] });
+  const syn = candidate({ clipId: 's', tags: ['dawn'] });
+  const sExact = scoreCandidate(exact, seg, 5.2, '9:16');
+  const sSyn = scoreCandidate(syn, seg, 5.2, '9:16');
+  assert.ok(sExact.relevance > sSyn.relevance, `exact ${sExact.relevance} should beat synonym ${sSyn.relevance}`);
+});
+
+test('scoreCandidate v2: description-only match still scores when keywords miss', () => {
+  const seg = segment({ visualKeywords: ['qzxw'], brollDescription: 'city skyline at dusk' });
+  const cand = candidate({ clipId: 'd', tags: ['city', 'skyline'] });
+  const s = scoreCandidate(cand, seg, 5.2, '9:16');
+  assert.ok(s.relevance > 0, 'description terms must contribute to relevance');
+});
+
+test('scoreCandidate v2: page-URL slug tokens count as candidate text', () => {
+  const seg = segment({ visualKeywords: ['sunrise'], brollDescription: 'sunrise' });
+  const withSlug = candidate({
+    clipId: 'a',
+    tags: [],
+    pageUrl: 'https://www.pexels.com/video/sunrise-city-timelapse-3121459/',
+  });
+  const withoutSlug = candidate({ clipId: 'b', tags: [], pageUrl: 'https://www.pexels.com/video/999/' });
+  const sWith = scoreCandidate(withSlug, seg, 5.2, '9:16');
+  const sWithout = scoreCandidate(withoutSlug, seg, 5.2, '9:16');
+  assert.ok(sWith.relevance > 0, 'slug words must feed relevance');
+  assert.equal(sWithout.relevance, 0);
+  assert.ok(sWith.total > sWithout.total);
+});
+
+test('scoreCandidate v2: total is the documented 55/35/10 weighted sum', () => {
+  const s = scoreCandidate(candidate(), segment(), 5.2, '9:16');
+  const expected = 0.55 * s.relevance + 0.35 * s.durationFit + 0.1 * s.orientation;
+  assert.ok(Math.abs(s.total - expected) < 1e-9, `total ${s.total} !== weighted sum ${expected}`);
+});
+
+test('tokensFromPageUrl: extracts slug words, drops numeric ids', () => {
+  const toks = tokensFromPageUrl('https://pixabay.com/videos/sunrise-city-skyline-770/');
+  assert.ok(toks.includes('sunrise'));
+  assert.ok(toks.includes('city'));
+  assert.ok(toks.includes('skyline'));
+  assert.ok(!toks.includes('770'), 'numeric ids must be dropped');
+});
+
+// ── multi-query merging ──────────────────────────────────────────────
+
+test('buildQueryVariants: primary + synonym + description variants', () => {
+  const variants = buildQueryVariants(segment());
+  assert.equal(variants.length, 3);
+  assert.equal(variants[0], buildSearchQuery(segment()));
+  assert.equal(variants[1], 'dawn urban hyperlapse');
+  assert.equal(variants[2], 'timelapse sunrise city skyline');
+  assert.equal(new Set(variants).size, variants.length, 'variants must be distinct');
+  for (const v of variants) assert.ok(v.length > 0);
+});
+
+test('buildQueryVariants: collapses to a single query when nothing expands', () => {
+  const variants = buildQueryVariants(segment({ visualKeywords: ['xyzq'], brollDescription: 'xyzq' }));
+  assert.deepEqual(variants, ['xyzq']);
+});
+
+function pexelsVideo(id: number, duration: number): Record<string, unknown> {
+  return {
+    id,
+    width: 1080,
+    height: 1920,
+    duration,
+    url: `https://www.pexels.com/video/${id}/`,
+    video_files: [
+      { id: 1, quality: 'hd', file_type: 'video/mp4', width: 1080, height: 1920, link: `https://cdn.example/v${id}.mp4` },
+    ],
+  };
+}
+
+test('searchPexelsMulti: merges variants and dedupes by clipId (tags unioned)', async () => {
+  const fetchImpl = mockFetch((url) => {
+    if (!url.includes('api.pexels.com')) return { status: 404, body: {} };
+    if (url.includes('dawn')) return { status: 200, body: pexelsBody([pexelsVideo(2, 6), pexelsVideo(3, 7)]) };
+    return { status: 200, body: pexelsBody([pexelsVideo(1, 8), pexelsVideo(2, 6)]) };
+  });
+  const cands = await searchPexelsMulti(segment(), 'k', '9:16', { fetchImpl, timeoutMs: 5_000 });
+  const ids = cands.map((c) => c.clipId).sort();
+  assert.deepEqual(ids, ['pexels-1', 'pexels-2', 'pexels-3']);
+  const dup = cands.find((c) => c.clipId === 'pexels-2');
+  assert.ok(dup, 'deduped clip must be present once');
+  assert.ok(dup.tags.includes('dawn'), `merged tags must keep the synonym variant signal: ${dup.tags.join(',')}`);
+});
+
+test('searchPexelsMulti: first-variant failure throws (provider falls through)', async () => {
+  const fetchImpl = mockFetch((url) => {
+    if (!url.includes('api.pexels.com')) return { status: 404, body: {} };
+    return { status: 401, body: { error: 'bad key' } };
+  });
+  await assert.rejects(
+    () => searchPexelsMulti(segment(), 'bad-key', '9:16', { fetchImpl, timeoutMs: 5_000 }),
+    /Pexels search failed: HTTP 401/,
+  );
+});
+
+test('searchPexelsMulti: later-variant 429 keeps the earlier candidates', async () => {
+  const fetchImpl = mockFetch((url) => {
+    if (!url.includes('api.pexels.com')) return { status: 404, body: {} };
+    if (url.includes('dawn') || url.includes('skyline')) return { status: 429, body: {} };
+    return { status: 200, body: pexelsBody([pexelsVideo(1, 8)]) };
+  });
+  const cands = await searchPexelsMulti(segment(), 'k', '9:16', { fetchImpl, timeoutMs: 5_000 });
+  assert.equal(cands.length, 1);
+  assert.equal(cands[0]?.clipId, 'pexels-1');
+});
+
+test('searchPixabayMulti: merges variants and dedupes by clipId', async () => {
+  const hit = (id: number, tags: string): Record<string, unknown> => ({
+    id,
+    pageURL: `https://pixabay.com/videos/x-${id}/`,
+    duration: 6,
+    tags,
+    user: 'tester',
+    videos: { medium: { url: `https://cdn.px.example/${id}.mp4`, width: 1280, height: 720 } },
+  });
+  const fetchImpl = mockFetch((url) => {
+    if (!url.includes('pixabay.com')) return { status: 404, body: {} };
+    if (url.includes('dawn')) return { status: 200, body: pixabayBody([hit(2, 'dawn, morning')]) };
+    return { status: 200, body: pixabayBody([hit(1, 'sunrise, city')]) };
+  });
+  const cands = await searchPixabayMulti(segment(), 'k', '9:16', { fetchImpl, timeoutMs: 5_000 });
+  const ids = cands.map((c) => c.clipId).sort();
+  assert.deepEqual(ids, ['pixabay-1', 'pixabay-2']);
+});
+
+// ── short-clip fit: arg builders (pure) ──────────────────────────────
+
+test('buildSmoothLoopArgs: chained xfade with cumulative offsets, trimmed to target', () => {
+  const args = buildSmoothLoopArgs({
+    inputPath: '/tmp/in.mp4',
+    outPath: '/tmp/out.mp4',
+    clipDurationSec: 2,
+    targetDurationSec: 5,
+  });
+  const fc = args[args.indexOf('-filter_complex') + 1] ?? '';
+  // fade = min(0.5, 2/4) = 0.5; repeats = ceil((5-0.5)/(2-0.5)) = 3
+  assert.match(fc, /split=3/);
+  assert.match(fc, /xfade=transition=fade:duration=0\.5:offset=1\.5/);
+  assert.match(fc, /xfade=transition=fade:duration=0\.5:offset=3(\D|$)/);
+  assert.match(fc, /trim=0:5/);
+  assert.ok(args.includes('-an'), 'b-roll audio is dropped (always muted)');
+  assert.ok(args.includes('/tmp/out.mp4'));
+});
+
+test('buildSmoothLoopArgs: tiny clips get a proportionally smaller fade', () => {
+  const args = buildSmoothLoopArgs({
+    inputPath: '/tmp/in.mp4',
+    outPath: '/tmp/out.mp4',
+    clipDurationSec: 0.8,
+    targetDurationSec: 3,
+  });
+  const fc = args[args.indexOf('-filter_complex') + 1] ?? '';
+  // fade = min(0.5, 0.8/4) = 0.2; repeats = ceil((3-0.2)/(0.8-0.2)) = 5
+  assert.match(fc, /split=5/);
+  assert.match(fc, /duration=0\.2/);
+});
+
+test('buildFreezeFrameArgs: tpad clone holds the last frame to the target', () => {
+  const args = buildFreezeFrameArgs({
+    inputPath: '/tmp/in.mp4',
+    outPath: '/tmp/out.mp4',
+    clipDurationSec: 2,
+    targetDurationSec: 5,
+  });
+  const vf = args[args.indexOf('-vf') + 1] ?? '';
+  assert.match(vf, /tpad=stop_mode=clone:stop_duration=3/);
+  assert.ok(args.includes('-t') && args[args.indexOf('-t') + 1] === '5');
+  assert.ok(args.includes('-an'));
+});
+
+// ── short-clip fit: real FFmpeg ──────────────────────────────────────
+
+/** Builds a tiny real MP4 (testsrc) for fit tests. */
+async function makeShortSrcMp4(dir: string, durationSec: number): Promise<string> {
+  const { spawnSync } = await import('node:child_process');
+  const out = path.join(dir, `src-${durationSec}s.mp4`);
+  const res = spawnSync(
+    'ffmpeg',
+    ['-hide_banner', '-y', '-f', 'lavfi', '-i', `testsrc=size=320x240:rate=30:duration=${durationSec}`,
+     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', out],
+    { encoding: 'utf8' },
+  );
+  assert.equal(res.status, 0, `testsrc generation failed: ${String(res.stderr).slice(-500)}`);
+  return out;
+}
+
+async function probeDuration(filePath: string): Promise<number> {
+  const { spawnSync } = await import('node:child_process');
+  const res = spawnSync(
+    'ffprobe',
+    ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', filePath],
+    { encoding: 'utf8' },
+  );
+  assert.equal(res.status, 0);
+  return parseFloat(String(res.stdout).trim());
+}
+
+test('fitShortClip loop: real FFmpeg extends a short clip with crossfade', async (t) => {
+  if (!ffmpegAvailable()) {
+    t.skip('ffmpeg não disponível — fit real não testável aqui');
+    return;
+  }
+  const dir = await mkdtemp(path.join(tmpdir(), 'sf-fit-'));
+  const src = await makeShortSrcMp4(dir, 1);
+  const fit = await fitShortClip(src, 1, 3, 'loop', dir, 'test-clip', { ffmpegPath: 'ffmpeg' });
+  assert.ok(fit, 'loop fit must succeed with FFmpeg present');
+  assert.equal(fit.durationSec, 3);
+  assert.ok(fit.localPath !== src);
+  const probed = await probeDuration(fit.localPath);
+  assert.ok(Math.abs(probed - 3) < 0.15, `fitted clip should be ~3s, got ${probed}`);
+  // Cache hit: second call returns the same file without re-encoding.
+  const again = await fitShortClip(src, 1, 3, 'loop', dir, 'test-clip', { ffmpegPath: 'ffmpeg' });
+  assert.equal(again?.localPath, fit.localPath);
+});
+
+test('fitShortClip freeze: real FFmpeg holds the last frame', async (t) => {
+  if (!ffmpegAvailable()) {
+    t.skip('ffmpeg não disponível — fit real não testável aqui');
+    return;
+  }
+  const dir = await mkdtemp(path.join(tmpdir(), 'sf-fit-'));
+  const src = await makeShortSrcMp4(dir, 1);
+  const fit = await fitShortClip(src, 1, 3, 'freeze', dir, 'test-clip', { ffmpegPath: 'ffmpeg' });
+  assert.ok(fit, 'freeze fit must succeed with FFmpeg present');
+  assert.equal(fit.durationSec, 3);
+  const probed = await probeDuration(fit.localPath);
+  assert.ok(Math.abs(probed - 3) < 0.15, `fitted clip should be ~3s, got ${probed}`);
+});
+
+test('fitShortClip: returns null (never throws) when FFmpeg is missing', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'sf-fit-'));
+  const fit = await fitShortClip('/tmp/whatever.mp4', 1, 3, 'loop', dir, 'x', {
+    ffmpegPath: '/nonexistent/ffmpeg-binary',
+  });
+  assert.equal(fit, null);
+});
+
+// ── resolveBroll: short-clip strategy integration ────────────────────
+
+/** Mock whose "download" serves REAL mp4 bytes (so FFmpeg can fit them). */
+function mockFetchWithRealClip(realBytes: Uint8Array, video: Record<string, unknown>): typeof fetch {
+  return mockFetch((url) => {
+    if (url.includes('api.pexels.com')) return { status: 200, body: pexelsBody([video]) };
+    if (url.includes('cdn.example')) return { status: 200, body: realBytes };
+    return { status: 404, body: {} };
+  });
+}
+
+test('resolveBroll: short stock clip is smooth-looped BY DEFAULT', async (t) => {
+  if (!ffmpegAvailable()) {
+    t.skip('ffmpeg não disponível — loop por omissão não testável aqui');
+    return;
+  }
+  const { cacheDir, projectDir } = await freshDirs();
+  const realBytes = new Uint8Array(await readFile(await makeShortSrcMp4(cacheDir, 2)));
+  const fetchImpl = mockFetchWithRealClip(realBytes, { ...PEXELS_VIDEO, duration: 2 });
+  const seg = segment({ actualDurationSec: 5.2 }); // needs 5.2s, clip is 2s
+  const broll = await resolveBroll(seg, {
+    format: '9:16',
+    cacheDir,
+    projectDir,
+    fetchImpl,
+    env: { PEXELS_API_KEY: 'k' },
+  });
+  assert.equal(broll.provider, 'pexels');
+  assert.equal(broll.shortClipStrategy, 'loop');
+  assert.equal(broll.durationSec, 5.2);
+  assert.ok(broll.localPath);
+  const probed = await probeDuration(broll.localPath);
+  assert.ok(Math.abs(probed - 5.2) < 0.2, `looped clip should be ~5.2s, got ${probed}`);
+});
+
+test("resolveBroll: shortClipStrategy 'freeze' is honored when configured", async (t) => {
+  if (!ffmpegAvailable()) {
+    t.skip('ffmpeg não disponível — estratégia freeze não testável aqui');
+    return;
+  }
+  const { cacheDir, projectDir } = await freshDirs();
+  const realBytes = new Uint8Array(await readFile(await makeShortSrcMp4(cacheDir, 2)));
+  const fetchImpl = mockFetchWithRealClip(realBytes, { ...PEXELS_VIDEO, duration: 2 });
+  const seg = segment({ actualDurationSec: 5.2 });
+  const broll = await resolveBroll(seg, {
+    format: '9:16',
+    cacheDir,
+    projectDir,
+    fetchImpl,
+    env: { PEXELS_API_KEY: 'k' },
+    shortClipStrategy: 'freeze',
+  });
+  assert.equal(broll.provider, 'pexels');
+  assert.equal(broll.shortClipStrategy, 'freeze');
+  assert.equal(broll.durationSec, 5.2);
+  assert.ok(broll.localPath);
+  const probed = await probeDuration(broll.localPath);
+  assert.ok(Math.abs(probed - 5.2) < 0.2, `frozen clip should be ~5.2s, got ${probed}`);
+});
+
+test('resolveBroll: long-enough clip is used as-is (no fit, no strategy recorded)', async (t) => {
+  if (!ffmpegAvailable()) {
+    t.skip('ffmpeg não disponível');
+    return;
+  }
+  const { cacheDir, projectDir } = await freshDirs();
+  const realBytes = new Uint8Array(await readFile(await makeShortSrcMp4(cacheDir, 2)));
+  const fetchImpl = mockFetchWithRealClip(realBytes, { ...PEXELS_VIDEO, duration: 8 });
+  const broll = await resolveBroll(segment(), {
+    format: '9:16',
+    cacheDir,
+    projectDir,
+    fetchImpl,
+    env: { PEXELS_API_KEY: 'k' },
+  });
+  assert.equal(broll.provider, 'pexels');
+  assert.equal(broll.durationSec, 8);
+  assert.equal(broll.shortClipStrategy, undefined);
+  assert.equal(broll.localPath, cachePathFor(cacheDir, 'pexels-3121459'));
+});
+
+test('resolveBroll: failed fit falls back to the honest short clip (never empty)', async () => {
+  const { cacheDir, projectDir } = await freshDirs();
+  const fetchImpl = mockFetch((url) => {
+    if (url.includes('api.pexels.com')) return { status: 200, body: pexelsBody([{ ...PEXELS_VIDEO, duration: 2 }]) };
+    if (url.includes('cdn.example')) return { status: 200, body: 'FAKEVIDEO' };
+    return { status: 404, body: {} };
+  });
+  const seg = segment({ actualDurationSec: 5.2 });
+  const broll = await resolveBroll(seg, {
+    format: '9:16',
+    cacheDir,
+    projectDir,
+    fetchImpl,
+    env: { PEXELS_API_KEY: 'k' },
+    ffmpegPath: '/nonexistent/ffmpeg-binary', // fit impossible
+  });
+  assert.equal(broll.provider, 'pexels');
+  assert.equal(broll.durationSec, 2, 'honest short duration is kept');
+  assert.equal(broll.shortClipStrategy, undefined);
+  assert.ok(broll.localPath, 'the downloaded short clip is still handed out');
 });

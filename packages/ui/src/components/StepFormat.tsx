@@ -1,11 +1,12 @@
 import { useState } from 'react';
-import type { VideoFormat } from '@shorts-forge/shared';
+import type { PlatformPresetId } from '@shorts-forge/shared';
 import type { LlmMode } from '../state';
+import { UI_PRESETS } from '../lib/presets';
 import { DEFAULT_MODEL, chat, ensureModel, isLoaded, isSupported } from '../lib/webllm';
 
 interface Props {
-  format: VideoFormat;
-  setFormat: (format: VideoFormat) => void;
+  preset: PlatformPresetId;
+  setPreset: (preset: PlatformPresetId) => void;
   llmMode: LlmMode;
   setLlmMode: (mode: LlmMode) => void;
   onGenerate: () => void;
@@ -141,40 +142,43 @@ function WebllmPanel() {
 }
 
 export default function StepFormat({
-  format,
-  setFormat,
+  preset,
+  setPreset,
   llmMode,
   setLlmMode,
   onGenerate,
 }: Props) {
   return (
     <div className="card">
-      <h2>Formato e geração</h2>
+      <h2>Plataforma e geração</h2>
       <p className="muted">
-        Últimos ajustes antes de gerar. A geração real da Spec (Fase A) corre na
-        Fase 2 — por agora vês as portas de revisão com dados de exemplo.
+        Escolhe a plataforma de destino — a resolução, as margens das
+        legendas e o alvo de loudness ajustam-se automaticamente. A geração
+        real da Spec (Fase A) corre na Fase 2 — por agora vês as portas de
+        revisão com dados de exemplo.
       </p>
 
       <div className="field">
-        <span className="label">Formato</span>
-        <div className="segmented" role="group" aria-label="Formato do vídeo">
-          <button
-            type="button"
-            className={format === '9:16' ? 'active' : ''}
-            onClick={() => setFormat('9:16')}
-            aria-pressed={format === '9:16'}
-          >
-            9:16 (Short)
-          </button>
-          <button
-            type="button"
-            className={format === '16:9' ? 'active' : ''}
-            onClick={() => setFormat('16:9')}
-            aria-pressed={format === '16:9'}
-          >
-            16:9 (Longo)
-          </button>
+        <span className="label">Plataforma de destino</span>
+        <div className="preset-grid" role="group" aria-label="Plataforma de destino">
+          {UI_PRESETS.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              className={preset === p.id ? 'preset-card active' : 'preset-card'}
+              onClick={() => setPreset(p.id)}
+              aria-pressed={preset === p.id}
+            >
+              <span className="preset-label">{p.label}</span>
+              <span className="preset-meta">{p.meta}</span>
+              <span className="preset-desc">{p.description}</span>
+            </button>
+          ))}
         </div>
+        <p className="hint">
+          O preset define a resolução e mantém as legendas fora das zonas de
+          interface de cada plataforma (barra de ações, progresso, descrição).
+        </p>
       </div>
 
       <div className="field">

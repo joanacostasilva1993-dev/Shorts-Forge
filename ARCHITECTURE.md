@@ -212,7 +212,9 @@ Detalhes do desenho em §6.
 // packages/pipeline/src/index.ts (proposto)
 import type { PipelineInput, Spec } from '@shorts-forge/shared';
 
-export type JobStatus = 'spec-draft' | 'awaiting-approval' | 'rendering' | 'done' | 'failed';
+export type JobStatus = 'spec-draft' | 'awaiting-approval' | 'rendering' | 'qc' | 'qc-failed' | 'done' | 'failed';
+// 'qc' / 'qc-failed': etapa de QC automático da Fase 4 (ver §8.1) —
+// extensão intencional do contrato original da Fase 1.
 export interface Job { id: string; status: JobStatus; input: PipelineInput; spec?: Spec; progress: number; error?: string; }
 
 export interface Pipeline {
@@ -404,9 +406,14 @@ Fase B, o `video` resolve por esta ordem:
    do hook), sem dependência externa.
 
 Regras de montagem: clip mais comprido → corta-se ao `actualDurationSec`;
-clip mais curto → loop suave ou freeze do último frame (nunca esticar no
-tempo, que cria artefactos). A atribuição final fica em `segment.broll`
-(`provider`, `clipId`, `url`, `durationSec`).
+clip mais curto → **loop suave com crossfade (omissão)** ou freeze do
+último frame (nunca esticar no tempo, que cria artefactos) — decisão
+resolvida na Fase 4: a omissão é `'loop'`, configurável por projeto via
+`shortClipStrategy: 'loop' | 'freeze'` no `Job` (`POST /api/jobs`); o
+clip original fica intacto na cache e o fit é um derivado
+determinístico, por isso a escolha é reversível. A atribuição final fica
+em `segment.broll` (`provider`, `clipId`, `url`, `durationSec`, mais
+`shortClipStrategy` quando houve fit). Detalhes em `docs/broll.md`.
 
 ## 8. Contratos API — UI ↔ backend
 
@@ -415,22 +422,33 @@ de progresso via **SSE**.
 
 ```
 POST   /api/jobs
-  body: { input: PipelineInput, format: VideoFormat, language: string }
+  body: { input: PipelineInput, format: VideoFormat, language: string,
+          preset?: PlatformPresetId, tts?: { engine?: string; voice?: string } }
   → 201 { job: Job }
+  # preset (opcional): tiktok | youtube-shorts | youtube-long |
+  #   instagram-reels. Quando presente, ganha sobre `format` e impõe a sua
+  #   proporção; sem preset, o format resolve para o preset omisso
+  #   (9:16 → youtube-shorts, 16:9 → youtube-long). Detalhes em
+  #   docs/platforms.md.
 
 POST   /api/jobs/:id/spec            # Fase A
   → 200 { spec: Spec }  (também emite SSE job:spec-draft)
 
 GET    /api/jobs/:id                 → 200 { job: Job }
-GET    /api/jobs/:id/events          # SSE: progress, spec-draft, rendering, done, failed
+GET    /api/jobs/:id/events          # SSE: progress, spec-draft, rendering, qc, qc-failed, done, failed
 PUT    /api/jobs/:id/spec
   body: { spec: Spec }               # utilizador edita/aprova
   → 200 { job: Job }                 # status → awaiting-approval → pronto
 
 POST   /api/jobs/:id/render          # Fase B
-  → 202 { job: Job }                 # status → rendering
+  → 202 { job: Job }                 # status → rendering (também aceite a partir de qc-failed: recomeça a Fase B)
 
-GET    /api/jobs/:id/download        → MP4 final (quando done)
+POST   /api/jobs/:id/retry-qc        # repete SÓ o QC de um job qc-failed (ver §8.1)
+  → 202 { job: Job }                 # status → qc (usa o final.mp4 existente)
+
+GET    /api/jobs/:id/qc-report        → 200 { report }  # relatório do QC (ver §8.1); 404 se ainda não correu
+GET    /api/jobs/:id/download        → MP4 final (só quando done; 409 honesto caso contrário)
+                                     # qc-failed → 409 qc_failed: o vídeo mau NUNCA é servido
 GET    /api/jobs/:id/preview         → MP4 de preview (baixa resolução)
 
 GET    /api/llm/status               → { providers: ProviderStatus[] }
@@ -439,6 +457,61 @@ POST   /api/llm/chat                 # debug/manual; body: ChatRequest → ChatR
 
 Erros: `{ error: { code: string, message: string } }` com HTTP adequado;
 `message` sempre em pt-PT (a UI mostra-o tal qual).
+
+### 8.1 Etapa de QC automático (Fase 4)
+
+Entre o render e o `done` há uma etapa automática de **controlo de
+qualidade** (`packages/pipeline/src/qc.ts`). O ciclo de vida passa a ser:
+
+```
+rendering → qc → done
+              ↘ qc-failed  (com motivos em pt-PT em job.error)
+```
+
+**Extensão intencional do contrato da Fase 1:** os estados `qc`
+(em curso) e `qc-failed` (terminal) foram acrescentados ao `JobStatus` e
+aos tipos de evento SSE. A justificação: servir um vídeo com defeito
+seria pior do que alargar o contrato — e o `/download` agora recusa
+qualquer job que não esteja `done` (409 honesto, com código `qc_failed`
+e os motivos no corpo).
+
+As 9 verificações (todas reais, via ffprobe/filtros FFmpeg sobre o
+`final.mp4`; se a ferramenta falhar, o check chumba — nunca passa "por
+defeito"):
+
+| # | Check | Regra | Racional do limiar |
+|---|---|---|---|
+| 1 | `audio-present` | stream de áudio existe **e** ≥ 1.0 s de áudio não-silencioso (silencedetect a −40 dB) | 1.0 s distingue "narração presente" de "ficheiro mudo"; −40 dB ignora ruído de fundo do codec |
+| 2 | `duration` | duração real dentro de max(±1.5 s, ±5%) da soma de `actualDurationSec` | ±1.5 s cobre arredondamentos de contentor/codec em vídeos curtos; ±5% escala para vídeos longos |
+| 3 | `captions` | `captions.srt` existe e nº de palavras dentro de max(5, ±5%) das palavras narradas | 5 palavras absorve diferenças de tokenização; ±5% escala |
+| 4 | `no-black` | nenhum preto contínuo > 1.0 s (blackdetect) | 1.0 s: abaixo disso pode ser transição; acima é plano sem imagem |
+| 5 | `no-freeze` | nenhuma imagem parada > 1.0 s (freezedetect) | idem — frame preso indica B-roll falhado |
+| 6 | `loudness` | integrada em −16 LUFS ± 2 | −16 LUFS é o alvo que a montagem já usa no `loudnorm`; ±2 dá margem ao loudnorm de passagem única e às plataformas |
+| 7 | `no-clipping` | pico máximo < 1.0 (0 dBFS) no astats | ≥ 1.0 = amostras a fundo de escala = distorção digital real |
+| 8 | `no-unexpected-silence` | nenhum silêncio > 0.8 s dentro do span narrado que a Spec (words[] reais do TTS) não prevê | 0.8 s: pausas naturais de respiração ficam abaixo; um buraco de TTS (frase cortada, glitch) fica acima. **Limitação:** analisa a mistura final — com música de fundo a sensibilidade baixa |
+| 9 | `no-abrupt-cut` | **AVISO** (nunca chumba): queda/subida brusca de energia (volumedetect em janelas de 0.1 s; "há energia" ≥ −20 dB, "há silêncio" ≤ −45 dB) numa fronteira de segmento | fronteiras costumam cair em silêncio (margens de respiro); um cliff aí é quase sempre corte seco na montagem |
+
+**Âmbito honesto (princípio da Joana: naturalidade da voz = critério
+nº 1):** nenhum algoritmo deteta "roboticidade" de forma fiável, por
+isso o QC **não** calcula nenhum "score de naturalidade" — seria fingir
+medição. A gate humana de aprovação de vozes continua a ser o árbitro da
+naturalidade; o QC apanha apenas artefactos mensuráveis (distorção,
+buracos, cortes). Para diagnóstico, o `qc-report.json` inclui o
+`provider` e a `voice` de TTS usados no job e o resumo por segmento.
+
+O relatório é escrito em `outputs/<jobId>/qc-report.json`
+(`schema: "shorts-forge/qc-report"`, `version: 1` — formato estável para
+a biblioteca de projetos da Fase 6 referenciar no `project.yaml`).
+
+**Recuperação de um `qc-failed`** (caminho honesto, sem aprovações
+manuais silenciosas):
+- `POST /api/jobs/:id/retry-qc` — repete só o QC sobre o `final.mp4`
+  existente (útil se o ficheiro foi corrigido por fora ou um check
+  falhou de forma transitória). Volta a `qc` e depois a `done` ou
+  `qc-failed`.
+- `POST /api/jobs/:id/render` — a partir de `qc-failed` recomeça a
+  Fase B completa (novo TTS + montagem + QC). Limpa o erro e o vídeo
+  rejeitado, para o `/download` nunca servir o ficheiro mau.
 
 ## 9. Política free-only (vinculativa)
 
@@ -465,6 +538,7 @@ Erros: `{ error: { code: string, message: string } }` com HTTP adequado;
 | 5 | Serviços Python como processos locais (spawn) | faster-whisper e Kokoro são ecossistema Python |
 | 6 | Hyperframes para frames + FFmpeg para montagem | Templates HTML/CSS reutilizáveis; FFmpeg é o standard de composição |
 | 7 | UI web local em vez de CLI | "Poucos cliques" exige UI; API REST permite CLI futura |
+| 8 | **Naturalidade da voz = critério nº 1** (Joana, 2026-10-06) | O áudio gerado NÃO pode soar robótico; vozes neurais (Edge-TTS Neural, Google WaveNet/Neural2) têm prioridade mesmo exigindo rede. O modo 100% local passa a alternativa de robustez, não a omissão, quando há conflito. Exceção da Fase 3 ("omissão não exige rede") cai por decisão consciente da Joana — o free-only (nada pago no caminho crítico) mantém-se |
 
 ## 11. Riscos e mitigação
 

@@ -12,6 +12,9 @@
  * - llmStatus.ts:    estados dos providers para GET /api/llm/status (real).
  * - orchestrate.ts:  PipelineOrchestrator — implementa a interface `Pipeline`
  *                    (ARCHITECTURE.md §4.3): Fase A → aprovação → Fase B.
+ * - qc.ts:          controlo de qualidade automático (Fase 4): checks reais
+ *                    ffprobe/FFmpeg entre o render e o `done`; escreve
+ *                    outputs/<jobId>/qc-report.json (real).
  * - server.ts:       servidor HTTP do contrato REST congelado
  *                    (ARCHITECTURE.md §8) em http://localhost:3000/api (real).
  *
@@ -62,6 +65,31 @@ export { PipelineOrchestrator, defaultRenderVideo } from './orchestrate.js';
 export type { Pipeline, OrchestratorDeps, RenderVideoFn } from './orchestrate.js';
 
 export { jobOutputsDir, outputsRoot } from './outputs.js';
+
+export {
+  runQc,
+  writeQcReport,
+  readQcReport,
+  writeCaptionsSrt,
+  countSrtWords,
+  countSpecWords,
+  formatQcFailurePt,
+  formatQcWarningsPt,
+  qcToolsAvailable,
+  QC_THRESHOLDS,
+  QC_CHECK_NAMES,
+  QC_REPORT_FILENAME,
+  QC_CAPTION_FILENAME,
+} from './qc.js';
+export type {
+  QcCheckName,
+  QcCheckResult,
+  QcReport,
+  QcSegmentInfo,
+  QcSeverity,
+  QcThresholds,
+  RunQcOptions,
+} from './qc.js';
 
 export { createServer, startServer, defaultBuildPreview } from './server.js';
 export type { ServerDeps, StartServerOptions, StartedServer } from './server.js';

@@ -7,7 +7,15 @@
  * TTS word timestamps (see captions.ts).
  */
 
-/** Where captions sit inside the frame. */
+/**
+ * Where captions sit inside the frame.
+ *
+ * NOTE: the position is interpreted INSIDE the platform preset's safe
+ * area (see `captionBoxFor` in captions.ts and `presets.ts`): renderers
+ * clamp the caption box so text never runs under platform UI overlays
+ * (action rails, progress bars). Templates only declare the preference;
+ * presets decide the margins.
+ */
 export type CaptionPosition = 'center' | 'lower-third';
 
 export interface BrandTemplate {

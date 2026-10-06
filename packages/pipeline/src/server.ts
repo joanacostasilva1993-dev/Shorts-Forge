@@ -8,10 +8,13 @@
  *   POST   /api/jobs/:id/spec        → 200 { spec }   (Fase A; emite SSE)
  *   PUT    /api/jobs/:id/spec        → 200 { job }    (validar + guardar)
  *   POST   /api/jobs/:id/render      → 202 { job }    (Fase B, async)
+ *   POST   /api/jobs/:id/retry-qc    → 202 { job }    (repete só o QC de um job qc-failed; async)
+ *   GET    /api/jobs/:id/qc-report   → 200 qc-report.json (ou 404 se ainda não existir)
  *   GET    /api/jobs/:id             → 200 { job }
  *   GET    /api/jobs/:id/events      → SSE (spec-draft, awaiting-approval,
- *                                      rendering, done, failed, progress)
- *   GET    /api/jobs/:id/download    → MP4 (quando existir; senão 404/409 honestos)
+ *                                      rendering, qc, qc-failed, done, failed, progress)
+ *   GET    /api/jobs/:id/download    → MP4 (só quando done; 409 honesto caso contrário —
+ *                                      qc-failed NUNCA é servido)
  *   GET    /api/jobs/:id/preview     → MP4 de preview, baixa resolução
  *                                      (render leve; 409 sem Spec aprovada)
  *   GET    /api/llm/status           → 200 { providers }
@@ -34,7 +37,7 @@ import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeF
 import { basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import type { ChatRequest, ChatResult } from '@shorts-forge/shared';
+import type { ChatRequest, ChatResult, PlatformPresetId } from '@shorts-forge/shared';
 import { createRouter, loadConfigFromEnv } from '@shorts-forge/llm-router';
 import { renderPreviewMp4 } from '@shorts-forge/video';
 import { ApiError, type Job, type JobEvent } from './jobs.js';
@@ -43,6 +46,7 @@ import { ServiceManager } from './services.js';
 import { PipelineOrchestrator, type Pipeline } from './orchestrate.js';
 import { getProviderStatuses, type ProviderStatus } from './llmStatus.js';
 import { jobOutputsDir } from './outputs.js';
+import { readQcReport } from './qc.js';
 
 export interface ServerDeps {
   pipeline: Pipeline;
@@ -215,6 +219,30 @@ async function handleJobs(
     const b = (body ?? {}) as Record<string, unknown>;
     const format = b['format'] ?? '9:16';
     const language = b['language'] ?? 'pt-PT';
+    const presetRaw = b['preset'];
+    if (presetRaw !== undefined && typeof presetRaw !== 'string') {
+      sendJson(res, 400, {
+        error: {
+          code: 'invalid_input',
+          message: 'O campo "preset" tem de ser uma string (ex. "tiktok").',
+        },
+      });
+      return;
+    }
+    const preset = typeof presetRaw === 'string' ? presetRaw : undefined;
+    const shortClipStrategy =
+      b['shortClipStrategy'] === 'loop' || b['shortClipStrategy'] === 'freeze'
+        ? (b['shortClipStrategy'] as 'loop' | 'freeze')
+        : undefined;
+    if (b['shortClipStrategy'] !== undefined && shortClipStrategy === undefined) {
+      sendJson(res, 400, {
+        error: {
+          code: 'invalid_input',
+          message: 'O campo "shortClipStrategy" tem de ser "loop" ou "freeze".',
+        },
+      });
+      return;
+    }
     const ttsRaw = b['tts'] as { engine?: unknown; voice?: unknown } | undefined;
     const ttsChoice:
       | { engine?: string | undefined; voice?: string | undefined }
@@ -228,9 +256,15 @@ async function handleJobs(
     try {
       const job = await pipeline.createJob(
         input as Parameters<Pipeline['createJob']>[0],
-        ttsChoice
-          ? { format: format as '9:16' | '16:9', language: language as string, ttsChoice }
-          : { format: format as '9:16' | '16:9', language: language as string },
+        {
+          format: format as '9:16' | '16:9',
+          language: language as string,
+          ...(ttsChoice ? { ttsChoice } : {}),
+          // Unknown ids are rejected by the orchestrator (400, pt-PT).
+          ...(preset !== undefined ? { preset: preset as PlatformPresetId } : {}),
+          // Invalid values are rejected above; 'loop' is the resolver default.
+          ...(shortClipStrategy !== undefined ? { shortClipStrategy } : {}),
+        },
       );
       sendJson(res, 201, { job });
     } catch (err) {
@@ -289,6 +323,26 @@ async function handleJobs(
     } catch (err) {
       sendError(res, err);
     }
+    return;
+  }
+
+  // POST /api/jobs/:id/retry-qc — repete só a etapa de QC de um job
+  // qc-failed (202, async). Caminho honesto de recuperação sem re-render.
+  if (sub === 'retry-qc' && parts.length === 2) {
+    if (method !== 'POST') return methodNotAllowed(res);
+    try {
+      const job = await pipeline.retryQc(id);
+      sendJson(res, 202, { job });
+    } catch (err) {
+      sendError(res, err);
+    }
+    return;
+  }
+
+  // GET /api/jobs/:id/qc-report — relatório JSON do controlo de qualidade.
+  if (sub === 'qc-report' && parts.length === 2) {
+    if (method !== 'GET') return methodNotAllowed(res);
+    await handleQcReport(res, deps, id);
     return;
   }
 
@@ -430,6 +484,20 @@ async function handleDownload(
     sendError(res, err);
     return;
   }
+  // Um vídeo que chumbou no QC nunca é servido — nem por acidente.
+  if (job.status === 'qc-failed') {
+    sendJson(res, 409, {
+      error: {
+        code: 'qc_failed',
+        message:
+          'O vídeo não passou no controlo de qualidade e não pode ser descarregado. ' +
+          (job.error ? `${job.error} ` : '') +
+          'Consulta o relatório em GET /api/jobs/:id/qc-report e depois ' +
+          'repete o controlo (POST /api/jobs/:id/retry-qc) ou corre o render de novo.',
+      },
+    });
+    return;
+  }
   if (job.status !== 'done') {
     sendJson(res, 409, {
       error: {
@@ -451,6 +519,34 @@ async function handleDownload(
     return;
   }
   serveMp4(res, job.outputPath, true);
+}
+
+/** Serves the QC report JSON written by the qc stage; 404 until it exists. */
+async function handleQcReport(
+  res: ServerResponse,
+  deps: ServerDeps,
+  id: string,
+): Promise<void> {
+  let job;
+  try {
+    job = await deps.pipeline.getJob(id);
+  } catch (err) {
+    sendError(res, err);
+    return;
+  }
+  const report = readQcReport(jobOutputsDir(job.id));
+  if (!report) {
+    sendJson(res, 404, {
+      error: {
+        code: 'qc_report_not_found',
+        message:
+          'Ainda não há relatório de controlo de qualidade para este job ' +
+          '(o QC corre depois do render).',
+      },
+    });
+    return;
+  }
+  sendJson(res, 200, { report });
 }
 
 /**
@@ -537,6 +633,7 @@ export async function defaultBuildPreview(job: Job): Promise<string> {
   }
   await renderPreviewMp4(spec, outPath, {
     format: job.format,
+    preset: job.preset,
     template: 'bold-social',
     tmpDir: join(outDir, '.tmp'),
   });

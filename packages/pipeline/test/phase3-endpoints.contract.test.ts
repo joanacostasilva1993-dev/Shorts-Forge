@@ -44,6 +44,9 @@ function fakePipeline(): { pipeline: Pipeline; store: JobStore } {
       store.emit(id, 'rendering');
       return updated;
     },
+    retryQc: async (id) => {
+      throw new ApiError('not_supported', 501, `retryQc não usado neste contrato (job ${id})`);
+    },
     getJob: async (id) => store.get(id),
     specEvents: async function* (id: string): AsyncIterable<JobEvent> {
       store.get(id);

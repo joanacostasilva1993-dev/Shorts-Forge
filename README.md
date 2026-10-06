@@ -138,7 +138,7 @@ shorts-forge/
 ├── ARCHITECTURE.md      # Arquitetura detalhada
 ├── ROADMAP.md           # Fases de desenvolvimento
 ├── LICENSE              # GNU AGPL-3.0 (texto completo)
-└── docs/                # Notas de decisão (providers TTS, avaliações)
+└── docs/                # Notas de decisão (providers TTS, B-roll, avaliações)
 ```
 
 ## Desenvolvimento

@@ -102,13 +102,20 @@ export interface AssembleOptions {
   musicLevel?: number | undefined;
   /** Timeout for the FFmpeg process in ms. Default 30 minutes. */
   timeoutMs?: number | undefined;
+  /**
+   * Integrated loudness target in LUFS for the final loudnorm pass.
+   * Defaults to -16 (previous behaviour); platform presets override it
+   * (e.g. -14 for the video platforms — see presets.ts).
+   */
+  loudnessLufs?: number | undefined;
 }
 
 /**
  * Builds the ffmpeg argv for the final assembly. Pure — no process is
  * spawned. Layout of inputs: [segmentClips..., narrationTracks...,
  * music?]. Audio chain: narration concat → (music sidechain-ducked) →
- * amix → loudnorm. Video chain: scale/crop → concat.
+ * amix → loudnorm (at `loudnessLufs`, default -16). Video chain:
+ * scale/crop → concat.
  */
 export function buildAssembleArgs(opts: AssembleOptions): string[] {
   if (opts.segmentClips.length === 0) {
@@ -116,6 +123,8 @@ export function buildAssembleArgs(opts: AssembleOptions): string[] {
   }
   const fps = opts.fps ?? 30;
   const [W, H] = opts.format === '9:16' ? [1080, 1920] : [1920, 1080];
+  const loudness = opts.loudnessLufs ?? -16;
+  const loudnormFilter = `loudnorm=I=${loudness}:TP=-1.5:LRA=11`;
 
   const args: string[] = ['-hide_banner', '-y'];
   for (const c of opts.segmentClips) args.push('-i', c);
@@ -161,10 +170,10 @@ export function buildAssembleArgs(opts: AssembleOptions): string[] {
     } else {
       filters.push(`[ncat]anull[aout]`);
     }
-    filters.push(`[aout]loudnorm=I=-16:TP=-1.5:LRA=11[aoutn]`);
+    filters.push(`[aout]${loudnormFilter}[aoutn]`);
     masterAudio = '[aoutn]';
   } else if (musicIdx >= 0) {
-    filters.push(`[${musicIdx}:a]volume=0.5,apad,loudnorm=I=-16:TP=-1.5:LRA=11[aoutn]`);
+    filters.push(`[${musicIdx}:a]volume=0.5,apad,${loudnormFilter}[aoutn]`);
     masterAudio = '[aoutn]';
   }
 
@@ -247,6 +256,11 @@ export interface AssembleJobInput {
   hwAccel?: HwAccel | undefined;
   /** Timeout for the FFmpeg process in ms. Default 30 minutes. */
   timeoutMs?: number | undefined;
+  /**
+   * Integrated loudness target in LUFS for the final loudnorm pass.
+   * Defaults to -16; platform presets override it (see renderJobVideo).
+   */
+  loudnessLufs?: number | undefined;
   /** Progress notes (audio prep, muxing). */
   onProgress?: ((message: string) => void) | undefined;
 }
@@ -332,7 +346,7 @@ export async function assembleJob(input: AssembleJobInput): Promise<string> {
   }
 
   input.onProgress?.('A compor a timeline final (FFmpeg)…');
-  return assemble({
+  const assembleOpts: AssembleOptions = {
     segmentClips,
     narrationTracks,
     outPath: join(outDir, 'final.mp4'),
@@ -342,6 +356,8 @@ export async function assembleJob(input: AssembleJobInput): Promise<string> {
     crf: input.crf,
     musicLevel: input.musicLevel,
     timeoutMs: input.timeoutMs,
-    ...(input.musicPath ? { musicPath: input.musicPath } : {}),
-  });
+  };
+  if (input.musicPath) assembleOpts.musicPath = input.musicPath;
+  if (input.loudnessLufs !== undefined) assembleOpts.loudnessLufs = input.loudnessLufs;
+  return assemble(assembleOpts);
 }

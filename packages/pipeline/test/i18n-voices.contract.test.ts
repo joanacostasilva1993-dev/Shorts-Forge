@@ -11,7 +11,9 @@
  *      pt-PT → edge-tts / pt-PT-DuarteNeural   (o Kokoro NÃO tem voz pt-PT)
  *      pt-BR → kokoro / pf_dora                (a voz que a Joana adorou)
  *      en    → kokoro / af_heart
- *      fr    → kokoro / ff_siwis               (única voz francesa do Kokoro-82M)
+ *      fr    → edge-tts / fr-FR-DeniseNeural   (decisão da Joana, 2026-10-06:
+ *        a ff_siwis do Kokoro foi rejeitada — robótica, mistura sotaque
+ *        pt com francês; fica só como último fallback local)
  *  - A cadeia de fallback começa sempre no idioma do job (nunca muda de
  *    idioma em silêncio no primeiro salto); a 1.ª entrada da cadeia é o
  *    default do idioma.
@@ -82,7 +84,7 @@ describe('voice catalog — defaults por idioma (sem env, sem override da UI)', 
     'pt-PT': { provider: 'edge-tts', voice: 'pt-PT-DuarteNeural' },
     'pt-BR': { provider: 'kokoro', voice: 'pf_dora' },
     en: { provider: 'kokoro', voice: 'af_heart' },
-    fr: { provider: 'kokoro', voice: 'ff_siwis' },
+    fr: { provider: 'edge-tts', voice: 'fr-FR-DeniseNeural' },
   };
   for (const [language, expected] of Object.entries(EXPECTED)) {
     it(`${language} → ${expected.provider} / ${expected.voice}`, () => {

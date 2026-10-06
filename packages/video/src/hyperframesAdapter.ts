@@ -34,8 +34,9 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import type { FrameDescriptor } from './frames.js';
-import { escapeHtml, captionFontSizePx } from './captions.js';
+import { escapeHtml, captionFontSizePx, captionBoxFor, hookTopFrac } from './captions.js';
 import { getTemplate, type BrandTemplate } from './templates.js';
+import type { SafeArea } from '@shorts-forge/shared';
 
 export interface CompositionOptions {
   width: number;
@@ -44,6 +45,12 @@ export interface CompositionOptions {
   compositionId?: string;
   /** Narration language tag (e.g. "pt-PT") — drives the caption font budget. Defaults to "pt-PT". */
   language?: string;
+  /**
+   * Platform preset safe area (fractions of the canvas). When given, the
+   * caption box and hook line are clamped inside it so burned-in text
+   * stays clear of platform UI overlays.
+   */
+  safeArea?: SafeArea;
 }
 
 export interface RenderFramesOptions extends CompositionOptions {
@@ -111,21 +118,34 @@ function isVideoUrl(url: string): boolean {
   return /\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(url);
 }
 
-function captionCss(template: BrandTemplate, width: number, language?: string): string {
+function captionCss(
+  template: BrandTemplate,
+  width: number,
+  language?: string,
+  safeArea?: SafeArea,
+): string {
   const scale = width / 1080;
   const fontSize = Math.round(captionFontSizePx(template, language ?? 'pt-PT') * scale);
   const strokePx = Math.max(0, Math.round(template.caption.strokePx * scale));
   const stroke = strokePx > 0
     ? `-webkit-text-stroke: ${strokePx}px #000; paint-order: stroke fill;`
     : '';
+  // The template's caption position is interpreted INSIDE the platform
+  // safe area: captions never sit under action rails or progress bars.
+  const box = safeArea
+    ? captionBoxFor(template.caption.position, safeArea)
+    : { bottomFrac: 0.14, maxWidthFrac: 0.88 };
+  const bottomPct = (box.bottomFrac * 100).toFixed(1);
+  const widthPct = (box.maxWidthFrac * 100).toFixed(1);
   const pos =
     template.caption.position === 'center'
       ? 'top: 50%; transform: translate(-50%, -50%);'
-      : 'bottom: 14%; transform: translateX(-50%);';
+      : `bottom: ${bottomPct}%; transform: translateX(-50%);`;
+  const hookTopPct = ((safeArea ? hookTopFrac(safeArea) : 0.07) * 100).toFixed(1);
   return `
 .sf-caption {
   position: absolute; left: 50%; ${pos}
-  width: 88%; text-align: center;
+  width: ${widthPct}%; text-align: center;
   font-family: ${template.fontStack};
   font-size: ${fontSize}px; font-weight: 900; line-height: 1.28;
   color: ${template.colors.fg};
@@ -140,7 +160,7 @@ function captionCss(template: BrandTemplate, width: number, language?: string): 
 .sf-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .sf-hl { position: absolute; inset: 0; }
 .sf-hook {
-  position: absolute; left: 50%; top: 7%; transform: translateX(-50%);
+  position: absolute; left: 50%; top: ${hookTopPct}%; transform: translateX(-50%);
   width: 92%; text-align: center;
   font-family: ${template.fontStack};
   font-size: ${Math.round(template.caption.fontSizePx * 0.85 * scale)}px; font-weight: 900; line-height: 1.2;
@@ -243,7 +263,7 @@ export function buildCompositionHtml(
 <html lang="${escapeHtml(opts.language ?? 'pt-PT')}">
 <head>
 <meta charset="utf-8" />
-<style>${captionCss(template, opts.width, opts.language)}</style>
+<style>${captionCss(template, opts.width, opts.language, opts.safeArea)}</style>
 </head>
 <body style="margin:0">
 <div data-composition-id="${escapeHtml(compositionId)}" data-start="0" data-duration="${total}" data-width="${opts.width}" data-height="${opts.height}" data-fps="${fps}" data-no-timeline style="position:relative;width:${opts.width}px;height:${opts.height}px">

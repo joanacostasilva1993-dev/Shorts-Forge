@@ -10,8 +10,10 @@ import GateRender from './components/GateRender';
 import { initialState, type AppState, type TtsEngine } from './state';
 import { generateMockSpec } from './mock';
 import { defaultVoiceFor } from './lib/voices';
+import { formatForPreset } from './lib/presets';
+import type { PlatformPresetId } from '@shorts-forge/shared';
 
-const STEP_NAMES = ['Entrada', 'Voz', 'Modelo visual', 'Formato e geração'];
+const STEP_NAMES = ['Entrada', 'Voz', 'Modelo visual', 'Plataforma'];
 
 const ENGINE_OF_PROVIDER: Record<string, TtsEngine> = {
   kokoro: 'kokoro',
@@ -23,6 +25,11 @@ export default function App() {
   const [state, setState] = useState<AppState>(initialState);
 
   const patch = (p: Partial<AppState>) => setState((s) => ({ ...s, ...p }));
+
+  /** Muda o preset de plataforma e sincroniza o formato implicado. */
+  const setPreset = (preset: PlatformPresetId) => {
+    patch({ preset, format: formatForPreset(preset) });
+  };
 
   /** Muda o idioma e repõe a voz omissa desse idioma. */
   const setLanguage = (language: string) => {
@@ -121,8 +128,8 @@ export default function App() {
           )}
           {state.step === 4 && (
             <StepFormat
-              format={state.format}
-              setFormat={(format) => patch({ format })}
+              preset={state.preset}
+              setPreset={setPreset}
               llmMode={state.llmMode}
               setLlmMode={(llmMode) => patch({ llmMode })}
               onGenerate={generate}

@@ -5,8 +5,8 @@
  * (from TTS in Phase B, or from transcription for audio inputs).
  * Nothing here estimates, interpolates or fakes timing.
  */
-import type { Word } from '@shorts-forge/shared';
-import type { BrandTemplate } from './templates.js';
+import type { SafeArea, Word } from '@shorts-forge/shared';
+import type { BrandTemplate, CaptionPosition } from './templates.js';
 
 /** One word with validated timing, in seconds. */
 export interface CaptionCue {
@@ -114,6 +114,53 @@ export function activeCue(cues: CaptionCue[], t: number): number {
     if (t >= c.start && t < c.end) return i;
   }
   return -1;
+}
+
+/**
+ * Caption box constraints inside a platform preset's safe area, as
+ * fractions of the canvas. This is where the preset's safe-area margins
+ * are applied to caption positioning: the caption box is clamped so it
+ * never runs under platform UI overlays (action rails, progress bars).
+ *
+ * - `lower-third`: the bottom inset is the max of the template's default
+ *   and the preset's bottom safe margin (e.g. TikTok's 16% pushes
+ *   captions up from the progress/description zone);
+ * - `center`: stays vertically centered, but the width shrinks so text
+ *   never runs under the side action rails.
+ */
+export interface CaptionSafeBox {
+  /** Bottom inset of the caption box, as a fraction of canvas height. */
+  bottomFrac: number;
+  /** Max caption width, as a fraction of canvas width. */
+  maxWidthFrac: number;
+}
+
+export function captionBoxFor(
+  position: CaptionPosition,
+  safeArea: SafeArea,
+  templateBottomFrac = 0.14,
+  templateWidthFrac = 0.88,
+): CaptionSafeBox {
+  const maxWidthFrac = Math.min(
+    templateWidthFrac,
+    Math.max(0.1, 1 - safeArea.left - safeArea.right),
+  );
+  if (position === 'center') {
+    return { bottomFrac: templateBottomFrac, maxWidthFrac };
+  }
+  return {
+    bottomFrac: Math.max(templateBottomFrac, safeArea.bottom),
+    maxWidthFrac,
+  };
+}
+
+/**
+ * Top inset for the hook-line overlay, as a fraction of canvas height:
+ * the max of the template's default and the preset's top safe margin
+ * (status bar / search buttons). Pure and deterministic.
+ */
+export function hookTopFrac(safeArea: SafeArea, templateTopFrac = 0.07): number {
+  return Math.max(templateTopFrac, safeArea.top);
 }
 
 /** Escapes text for safe embedding in HTML. */

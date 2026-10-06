@@ -127,8 +127,11 @@ Teste de construção de comando (sem executar FFmpeg):
   narração) e **loudnorm** (loudness consistente) — asserts sobre a string
   de args, não sobre o binário.
 - `render()` com `crf`/`preset` customizados reflete-os nos args.
-- B-roll mais curto que `actualDurationSec` → args incluem loop ou freeze
-  (nunca `setpts` a esticar no tempo).
+- B-roll mais curto que `actualDurationSec` → o resolvedor estende o clip
+  com FFmpeg **antes** do render: loop suave com crossfade por omissão,
+  `freeze` quando `shortClipStrategy: 'freeze'` (nunca `setpts` a esticar
+  no tempo) — ver `buildSmoothLoopArgs`/`buildFreezeFrameArgs`/`fitShortClip`
+  e os testes em `packages/video/src/test/broll.test.ts`.
 
 ### 4.3 Render real (QA manual, Fase 4)
 
@@ -396,12 +399,13 @@ mesmo ficheiro de contrato.)
   `assemble is an unmistakable stub` no `ffmpeg.test.ts` fixa-o).
 - `GET …/preview` real (baixa resolução) ligado ao passo de preview da UI.
 
-## 14. B-roll — estratégia (Fase 3b) ✅ entregue
+## 14. B-roll — estratégia (Fase 3b) ✅ entregue · afinado na Fase 4
 
 Implementação: `packages/video/src/broll.ts`. Testes do dono:
-`packages/video/src/test/broll.test.ts` — **23 testes** (revistos pelo QA;
+`packages/video/src/test/broll.test.ts` — **45 testes** (revistos pelo QA;
 cobrem o contrato todo). A camada HTTP é mockada via `fetchImpl`
-injetável — **zero chamadas à rede real** na suite.
+injetável — **zero chamadas à rede real** na suite. Detalhes da
+pontuação v2, multi-query e clips curtos em `docs/broll.md`.
 
 ### 14.1 Contrato verificado (cascata ARCHITECTURE.md §7)
 
@@ -415,15 +419,26 @@ injetável — **zero chamadas à rede real** na suite.
 | 2 segmentos, 1 clip | o 2.º não reutiliza o `clipId` (registo no-repeat por projeto, persistido em `broll-registry.json`) |
 | 2.ª resolução do mesmo clip | **sem re-download** (cache hit por `clipId`) |
 | `downloadToCache` com HTTP 403 | `false`, sem lançar |
+| clip stock mais curto que o segmento | estendido com FFmpeg: **loop suave com crossfade por omissão** (`shortClipStrategy: 'loop'` em `segment.broll`); `'freeze'` quando o projeto opta; falha no fit → clip curto honesto, nunca vazio |
+| clip stock já com duração suficiente | usado tal qual (sem fit, sem `shortClipStrategy` registado) |
 
 ### 14.2 Unidades puras verificadas
 
-- `scoreCandidate`: duração exata → `durationFit` 1.0; 2× → 0.7 (corta-se,
-  barato); metade → 0.375 (loop é pior que corte); portrait ganha em 9:16.
+- `scoreCandidate` (v2): relevância = 0.7×overlap de keywords expandidas
+  (termo 1.0 / radical 0.9 / sinónimo 0.7) + 0.3×overlap da descrição,
+  contra tags ∪ slug do URL ∪ tokens da query; exato ainda bate sinónimo;
+  duração exata → `durationFit` 1.0; 2× → 0.7 (corta-se, barato);
+  metade → 0.375 (estender é pior que cortar); portrait ganha em 9:16;
+  `total` = 0.55×relevance + 0.35×durationFit + 0.10×orientation.
 - `selectBestCandidate`: escolhe o melhor score; salta ids usados; `null`
   quando todos usados (a cascata continua).
-- `buildSearchQuery`: keywords primeiro (máx 3); sem keywords → tokens da
-  descrição; nunca vazio (`'abstract background'`).
+- `buildSearchQuery` / `buildQueryVariants`: keywords primeiro (máx 3);
+  variantes = primária + sinónimos + descrição (2–3, distintas, nunca
+  vazias); `searchPexelsMulti`/`searchPixabayMulti` fundem e desduplicam
+  por `clipId` (1.ª variante falha → propaga; tardias falham → ficam as
+  já recolhidas).
+- `buildSmoothLoopArgs` / `buildFreezeFrameArgs`: xfade encadeado com
+  offsets cumulativos + trim exato; tpad clone até à duração-alvo.
 - `UsedClipRegistry`: `mark`/`has` + persistência entre loads; ficheiro
   corrupto/ausente → começa vazio, sem crash.
 - Builders de args FFmpeg (`buildGradientStillArgs`, `buildKenBurnsArgs`,
@@ -453,7 +468,7 @@ Ficheiro: `packages/pipeline/test/i18n-voices.contract.test.ts`
 | pt-PT | edge-tts / `pt-PT-DuarteNeural` | o Kokoro **não tem** voz pt-PT — usar Kokoro aqui seria sotaque brasileiro silencioso (teste anti-regressão dedicado) |
 | pt-BR | kokoro / `pf_dora` | a voz que a Joana adorou; local e grátis |
 | en | kokoro / `af_heart` | voz inglesa do Kokoro mais bem avaliada |
-| fr | kokoro / `ff_siwis` | **única** voz francesa do Kokoro-82M (confirmada em runtime: `models/kokoro/voices/ff_siwis.pt`); a Joana decide de ouvido |
+| fr | edge-tts / `fr-FR-DeniseNeural` | decisão da Joana de ouvido (2026-10-06): a `ff_siwis` (única voz francesa do Kokoro-82M, confirmada em runtime) foi **rejeitada** — robótica, mistura sotaque pt com francês; fica só como último fallback local |
 
 Contrato verificado:
 - `supportedLanguages()` → `[pt-PT, pt-BR, en, fr]` (ordem do catálogo = ordem da UI).
@@ -509,18 +524,18 @@ Edge-TTS, por isso não deu para validar aqui). Ferramenta pronta:
 `packages/tts/service/verify_voices.py`.
 
 - [ ] correr `verify_voices.py` no PC da Joana e confirmar cada nome:
-      `fr-FR-DeniseNeural`, `fr-FR-HenriNeural` (candidatas a omissão fr se
-      a `ff_siwis` não convencer), `pt-BR-FranciscaNeural`,
+      `fr-FR-DeniseNeural`, `fr-FR-HenriNeural` (DeniseNeural é a omissão
+      fr desde 2026-10-06 — decisão da Joana; confirmar que o nome existe),
+      `pt-BR-FranciscaNeural`,
       `pt-BR-AntonioNeural`, `en-US-AriaNeural`, `en-US-GuyNeural`,
       `pt-PT-Neural2-A`, `pt-BR-Neural2-A`, `en-US-Neural2-A`,
       `fr-FR-Neural2-A` (estas últimas só com credenciais Google)
 - [ ] gerar amostras Edge-TTS em **francês** (2–3 frases com entoação
       variada: pergunta, exclamação, frase longa) e a Joana ouve e
       classifica: naturalidade 1–5, artefactos
-- [ ] comparar `ff_siwis` (Kokoro, omissão fr atual) vs
-      `fr-FR-DeniseNeural` — a Joana decide de ouvido qual fica como
-      omissão; atualizar `defaultVoice`/`defaultProvider` de `fr` no
-      `voices.catalog.json` em conformidade
+- [x] ~~comparar `ff_siwis` (Kokoro) vs `fr-FR-DeniseNeural` — a Joana
+      decidiu de ouvido (2026-10-06): `ff_siwis` rejeitada; omissão fr =
+      `fr-FR-DeniseNeural`, catálogo atualizado~~
 - [ ] repetir para `pt-BR-FranciscaNeural` vs `pf_dora` (pt-BR já tem
       omissão Kokoro; confirmar que a Edge-TTS é fallback são)
 - [ ] marcar `verified: true` no catálogo para cada nome confirmado e
@@ -540,3 +555,180 @@ e ainda adicionou os próprios testes em `test/voiceCatalog.test.ts`.
 Lição de QA: regressões de typecheck em código partilhado quebram o
 `npm test` do pacote inteiro (o `build` falha antes do `node --test`) —
 o `typecheck` faz parte do "verde".
+
+---
+
+# Fase 4 — Montagem + QC (adenda QA, 2026-10-06)
+
+> Estado verificado contra a realidade: os três especialistas entregaram
+> código **e** testes próprios (revistos pelo QA — honestos, sem sucesso
+> fingido). O QA acrescentou os contratos em falta (tabela de presets no
+> `video`), corrigiu 3 regressões de integração vindas de edições
+> paralelas e atualizou testes/docs para a decisão da Joana sobre a voz
+> francesa (ver §16.5).
+
+## 16. Estratégia de testes da Fase 4
+
+### 16.1 Afinação do B-roll — estratégia ✅ entregue e testada
+
+Implementação: `packages/video/src/broll.ts` (scoring v2 + short-clip
+fit). Testes do dono: `packages/video/src/test/broll.test.ts` —
+**45 testes** (revistos pelo QA).
+
+| Área | Contrato verificado |
+|---|---|
+| Scoring v2 | sinónimos (`sunrise`→`dawn`) pontuam acima de tags não relacionadas; keyword exata bate o seu sinónimo; descrição conta quando as keywords falham; tokens do slug do page-URL (ex. `pixabay.com/videos/sunrise-city-770/`) entram no texto do candidato; total = soma ponderada 55/35/10 documentada |
+| Multi-query | `searchPexelsMulti`/`searchPixabayMulti`: juntam variantes (primária + sinónimos + descrição), deduplicam por `clipId` (tags em união); falha da 1.ª variante → fall-through do provider; 429 numa variante tardia mantém os candidatos já obtidos |
+| Short-clip fit (puro) | `buildSmoothLoopArgs`: cadeia xfade com offsets cumulativos (`offset_k = k·d − k·fade`), `trim` exato ao alvo, `-an`; `buildFreezeFrameArgs`: `tpad=stop_mode=clone` com a duração da lacuna, `-t` exato |
+| Short-clip fit (real) | `fitShortClip` com FFmpeg real: clip de 1 s → 3 s por `loop` e por `freeze` (duração verificada com ffprobe, ±0,15 s); 2.ª chamada = cache hit determinístico (`fit-<strategy>-<clipId>-<T>s.mp4`); `null` (nunca throw) sem FFmpeg |
+| Integração | `resolveBroll` com clip de stock curto: **por omissão faz smooth-loop** (`shortClipStrategy: 'loop'` registado na entrada, duração final = `needed`); com `shortClipStrategy: 'freeze'` honra o freeze; clip que já chega → sem fit e sem estratégia registada; fit falhado → clip curto honesto (never-empty) |
+| Configurabilidade | `POST /api/jobs { shortClipStrategy }` validado (`loop`/`freeze`, 400 `invalid_input` senão); `job.shortClipStrategy` viaja até `resolveBrollForSegments` |
+
+### 16.2 QC automático — estratégia ✅ entregue e testado
+
+Implementação: `packages/pipeline/src/qc.ts` (9 checks reais) +
+integração em `orchestrate.ts` (`rendering → qc → done/qc-failed`,
+`retryQc`) + rotas em `server.ts` (`POST …/retry-qc`,
+`GET …/qc-report`, `/download` 409 `qc_failed`). Documentado em
+`ARCHITECTURE.md` §8.1. Testes do dono: `packages/pipeline/test/qc.test.ts`
+(**16 testes**, revistos pelo QA) + bloco "etapa de QC" em
+`orchestrate.test.ts` (5 testes) + rotas em `server.test.ts` (3 testes).
+
+| Check | Estímulo (fixture FFmpeg real, gerada no teste) | Esperado (verificado) |
+|---|---|---|
+| `audio-present` | `bad-silent.mp4` (anullsrc) / `bad-noaudio.mp4` (`-an`) | chumba; `reasonPt` fala de silêncio / "não tem faixa de áudio" |
+| `duration` | vídeo 6 s vs Spec de 4 s | chumba (desvio > max(1,5 s, 5%)) |
+| `captions` | `captions.srt` em falta; SRT com contagem inconsistente | chumba nos dois casos |
+| `no-black` | 4 s de `color=black` | chumba |
+| `no-freeze` | imagem parada > 1 s | chumba |
+| `loudness` | tom sem normalizar (−9 LUFS integrados) | chumba; detalhe mostra o valor medido |
+| `no-clipping` | áudio com pico a 0 dBFS | chumba (`severity: 'error'`, detalhe `max peak level=1`) |
+| `no-unexpected-silence` | buraco de silêncio a meio da narração | chumba e diz o `seg-01`; `audio-present` continua a passar (o buraco é localizado) |
+| `no-abrupt-cut` | corte seco numa fronteira de segmento | **AVISO** (`severity: 'warning'`, `warningPt` em pt-PT) — nunca chumba; `report.passed` continua `true` |
+
+Contrato do relatório e do ciclo de vida (verificado):
+
+- `runQc` com vídeo em falta **atira** erro honesto (nada é inventado);
+  com conteúdo mau devolve `passed: false` — nunca throw.
+- **Render partido falha o QC (e2e)** — o teste obrigatório: vídeo
+  silencioso+preto → `passed: false`, `audio-present` e `no-black`
+  chumbados, `formatQcFailurePt` com motivos pt-PT, `qc-report.json`
+  escrito e lido de volta (`schema: 'shorts-forge/qc-report'`,
+  `version: 1`, 9 checks).
+- `writeCaptionsSrt`: n palavras da Spec = n palavras do SRT (offsets
+  acumulados por segmento; sem TTS → uma legenda por segmento, degradação
+  honesta).
+- Orquestração: `render` partido → `qc-failed` com `job.error` em pt-PT e
+  eventos `qc` → `qc-failed`; `retryQc` recupera para `done` quando o MP4
+  é corrigido (e limpa o erro); `render` a partir de `qc-failed` recomeça
+  a Fase B e limpa o vídeo rejeitado; `retryQc` fora de `qc-failed` →
+  409 `invalid_state`.
+- Rotas: `GET …/download` com `qc-failed` → 409 `qc_failed` (nunca serve
+  o vídeo mau); `GET …/qc-report` → 404 antes do QC, 200 `{ report }`
+  depois.
+
+### 16.3 Presets por plataforma — estratégia ✅ entregue e testado
+
+Implementação: `packages/video/src/presets.ts` (tabela) +
+`render.ts` (`canvasForPreset`, `renderTargetFor`, `preset` em
+`SegmentRenderOptions`/`JobVideoOptions`/`PreviewRenderOptions`) +
+`ffmpeg.ts` (`loudnessLufs` no `AssembleOptions`, default −16) +
+`pipeline` (`Job.preset`, `POST /api/jobs { preset }`, precedência
+preset > format) + UI (`StepFormat` com grelha de presets).
+Documentado em `docs/platforms.md`.
+
+Testes do dono (API): `packages/pipeline/test/presets.contract.test.ts`
+(6 testes — preset aceite e guardado, preset ganha ao `format`
+conflituante, preset sozinho impõe o formato, `format` sozinho resolve
+para o preset omisso do aspeto, 400 em preset desconhecido/não-string).
+Testes do QA (tabela + honra no render):
+`packages/video/src/test/presets.contract.test.ts` (**20 testes**):
+
+| Área | Contrato verificado |
+|---|---|
+| Tabela | exatamente os 4 presets (`tiktok`, `youtube-shorts`, `youtube-long`, `instagram-reels`); cada um implica o formato do seu canvas (1080×1920 vertical, 1920×1080 horizontal); durações 180 s / `null`; safe areas são frações sãs (< 50% cada, somas < 100%); ordenação documentada (`tiktok.right ≥ youtube-shorts.right`, `instagram-reels.bottom ≥ tiktok.bottom`); loudness −14 LUFS nos 4; labels/descrições/quirks pt-PT não vazios |
+| Resolução | `defaultPresetForFormat` (9:16 → youtube-shorts, 16:9 → youtube-long); `resolvePreset`: preset explícito ganha, `format` sozinho mapeia, nada → youtube-shorts, desconhecido atira em pt-PT; `isPlatformPresetId` como type guard |
+| `safeAreaPx` | frações → px exatos (tiktok 1080×1920 → `{top: 192, right: 162, bottom: 307, left: 65}`); escala com o canvas |
+| Honra no render | `canvasForPreset`; `renderTargetFor` com preset ganha ao formato e carrega a safe area (sem preset → canvas do aspeto, sem safe area — caminho legado); `buildAssembleArgs` com `loudnessLufs: -14` → `loudnorm=I=-14` (omissão mantém `I=-16`) |
+
+### 16.4 Lista de skips honestos (Fase 4)
+
+| Skip | Motivo | Onde |
+|---|---|---|
+| `LIVE: Pexels/Pixabay search` | sem `PEXELS_API_KEY`/`PIXABAY_API_KEY` no ambiente — nunca simulados | `broll.test.ts` |
+| `fitShortClip` / short-clip por omissão | sem `ffmpeg` no PATH — o fit real não é testável | `broll.test.ts` |
+| `qc.test.ts` (todo o ficheiro) | sem `ffmpeg`+`ffprobe` (`qcToolsAvailable()`) | `packages/pipeline/test/qc.test.ts` |
+| ciclo completo com QC no `orchestrate.test.ts` | idem (`HAVE_QC_TOOLS`) | `orchestrate.test.ts` |
+| serviços Python (`transcription`, `tts`) | venv em falta neste ambiente | `npm test` dos pacotes |
+| `verify_voices.py` + amostras fr | só no PC da Joana (nomes Edge-TTS `verified: false`) | manual, `docs/i18n.md` §4 |
+
+### 16.5 Voz francesa — decisão da Joana (2026-10-06) e o que mudou
+
+A Joana ouviu a `ff_siwis` (Kokoro) e **rejeitou-a**: demasiado robótica,
+mistura sotaque português com francês. O catálogo
+(`packages/tts/voices.catalog.json`, fonte única de verdade) foi atualizado:
+omissão fr = `edge-tts` / `fr-FR-DeniseNeural`; cadeia
+`DeniseNeural → fr-FR-HenriNeural → kokoro/ff_siwis → google/fr-FR-Neural2-A`;
+a `ff_siwis` tem nota de rejeição e fica só como **último fallback local**.
+
+**Exceção deliberada ao princípio "omissão não exige rede"** (Fase 3): a
+Joana decidiu conscientemente o contrário para o francês — a naturalidade
+da voz é o critério nº 1, acima da preferência por local/offline. O
+Edge-TTS é grátis e sem chave (o free-only mantém-se); o fallback 100%
+local continua a existir para robustez. Documentado em `docs/i18n.md` §3.
+
+Atualizações aplicadas pelo QA:
+
+- Testes: `orchestrate.test.ts` (job francês → `edge-tts`/`fr-FR-DeniseNeural`),
+  `i18n-voices.contract.test.ts` (tabela EXPECTED), `voiceCatalog.test.ts`
+  (default fr + teste novo: `ff_siwis` sobrevive só como último fallback
+  local, e a omissão já não é local).
+- `test_voices_catalog.py`: **não** alterado o teste existente
+  (`language_default_voice("kokoro", "fr") == "ff_siwis"` — é scoped ao
+  provider kokoro e continua válido: a `ff_siwis` ainda é a única voz
+  francesa do Kokoro); adicionado `test_french_language_default_is_denise_neural`
+  (default do idioma + cadeia).
+- Docs: `docs/i18n.md` §3 reescrito (rejeição + exceção deliberada) e §4
+  atualizado; `docs/tts-providers.md` (omissões + nota na secção Kokoro);
+  `ROADMAP.md` e `TEST_PLAN.md` §15 (tabela e checklist).
+- UI verificada: `packages/ui/src/lib/voices.ts` lê `defaultProvider`/
+  `defaultVoice` do catálogo dinamicamente — **nenhum `ff_siwis` hardcoded**
+  em `packages/ui/src/`; o serviço Python também não tem defaults hardcoded.
+
+### 16.6 Regressões de integração apanhadas pelo QA (Fase 4)
+
+Trabalho paralelo = edições que aterram a meio de uma run. Duas
+regressões de `typecheck` (que quebram o `npm test` inteiro, porque o
+`build` corre antes do `node --test`):
+
+1. `exactOptionalPropertyTypes` vs `store.update(id, { …, error: undefined,
+   outputPath: undefined })` — os donos passaram `undefined` explícito
+   para limpar campos (o `update()` até trata isso de propósito), mas o
+   tipo `Job` não permitia. Fix do QA em `packages/pipeline/src/jobs.ts`:
+   `error?: string | undefined`, `outputPath?: string | undefined`
+   (mesmo padrão do fix da Fase 3 em `voiceCatalog.ts`).
+2. `Pipeline` ganhou `retryQc` mas o fake de
+   `phase3-endpoints.contract.test.ts` não — adicionado stub honesto
+   (501 `not_supported`, nunca chamado neste contrato); tipo do array
+   `seen` em `orchestrate.test.ts` alargado para `| undefined`.
+3. Corrida a meio de edição: uma run apanhou `wordCount` 9 vs 6 no
+   `qc.test.ts` enquanto o dono editava spec de teste e implementação em
+   simultâneo — re-run limpo logo a seguir: **16/16 verdes**. Lição: com
+   escrita paralela, um vermelho isolado pede re-run antes de culpar o
+   código.
+
+### 16.7 Princípio "naturalidade primeiro" (Joana, 2026-10-06)
+
+A naturalidade da voz é o critério nº 1, acima de local/offline; o áudio
+gerado não pode soar robótico. Documentado em `ARCHITECTURE.md` §10
+(decisão nº 8) e `docs/tts-providers.md` §8. Consequências já aplicadas
+e cobertas por testes:
+
+- Cadeia pt-PT reordenada para `DuarteNeural → RaquelNeural →
+  google/pt-PT-Neural2-A → kokoro/pf_dora` (nenhuma voz pt-BR precede
+  uma neural pt-PT nativa; `pf_dora` = último recurso offline) — teste
+  novo em `voiceCatalog.test.ts` fixa a ordem; nenhum teste afirmava a
+  ordem antiga (verificado por varredura).
+- Inglês: default continua `kokoro/af_heart` (nunca rejeitado), mas é
+  candidato a A/B por ouvido (`af_heart` vs `en-US-AriaNeural`) —
+  checklist em `docs/i18n.md` §4; **default só muda depois de ela ouvir**.

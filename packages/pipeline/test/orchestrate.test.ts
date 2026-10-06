@@ -5,7 +5,8 @@
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChatRequest, PipelineInput, Spec } from '@shorts-forge/shared';
@@ -13,6 +14,51 @@ import { PipelineOrchestrator } from '../src/orchestrate.js';
 import { ApiError, JobStore, type Job, type JobEvent } from '../src/jobs.js';
 import type { ServiceClients } from '../src/pythonBridge.js';
 import type { ServiceManager } from '../src/services.js';
+import { jobOutputsDir } from '../src/outputs.js';
+import { QC_REPORT_FILENAME } from '../src/qc.js';
+
+/** O QC corre ffmpeg/ffprobe reais — sem eles, os testes de ciclo completo saltam. */
+const HAVE_QC_TOOLS = ((): boolean => {
+  try {
+    const r = spawnSync('ffprobe', ['-hide_banner', '-version'], { timeout: 10_000 });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+})();
+
+/**
+ * Gera um MP4 real minúsculo para o double de render dos testes.
+ * `good` honra a duração total da Spec (passa no QC); `broken` é
+ * silencioso + preto (chumba no QC de propósito).
+ */
+function writeTestFixtureMp4(outPath: string, durationSec: number, broken: boolean): void {
+  const videoSrc = broken
+    ? `color=c=black:size=320x240:rate=30:duration=${durationSec}`
+    : `testsrc=size=320x240:rate=30:duration=${durationSec}`;
+  const audioSrc = broken
+    ? `anullsrc=r=48000:cl=stereo:d=${durationSec}`
+    : `sine=frequency=440:duration=${durationSec}`;
+  mkdirSync(join(outPath, '..'), { recursive: true });
+  const res = spawnSync(
+    'ffmpeg',
+    [
+      '-hide_banner', '-y',
+      '-f', 'lavfi', '-i', videoSrc,
+      '-f', 'lavfi', '-i', audioSrc,
+      '-af', broken ? 'anull' : 'loudnorm=I=-16:TP=-1.5:LRA=11',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-ar', '48000', '-shortest',
+      outPath,
+    ],
+    { timeout: 120_000, encoding: 'utf8' },
+  );
+  if (res.error || res.status !== 0 || !existsSync(outPath)) {
+    throw new Error(
+      `double de render (teste) falhou: ${String(res.error ?? res.stderr ?? '').slice(-1200)}`,
+    );
+  }
+}
 
 function llmSpecJson() {
   return {
@@ -91,29 +137,46 @@ function fakeServiceManager(): ServiceManager {
 }
 
 let cacheDir = '';
+let outputsDir = '';
 beforeEach(() => {
   cacheDir = mkdtempSync(join(tmpdir(), 'sf-cache-'));
+  // Os renders dos testes escrevem ficheiros reais (o QC analisa-os) —
+  // vão para um tmpdir, nunca para o repo.
+  outputsDir = mkdtempSync(join(tmpdir(), 'sf-outputs-'));
+  process.env.SHORTS_FORGE_OUTPUTS_DIR = outputsDir;
 });
 afterEach(() => {
   rmSync(cacheDir, { recursive: true, force: true });
+  rmSync(outputsDir, { recursive: true, force: true });
+  delete process.env.SHORTS_FORGE_OUTPUTS_DIR;
 });
 
 function makeOrchestrator(
   router: { chatJson: (req: ChatRequest) => Promise<{ data: unknown }> },
   services?: ServiceClients,
+  renderMode: 'good' | 'broken-first' = 'good',
 ): PipelineOrchestrator {
+  let calls = 0;
   return new PipelineOrchestrator({
     router,
     services: services ?? mockServices(),
     serviceManager: fakeServiceManager(),
     store: new JobStore(),
     transcriptCacheDir: cacheDir,
-    // Fast video double: the real render (Hyperframes + FFmpeg) is covered
-    // by the video package's e2e test; here we only assert the wiring.
+    // Double de vídeo que gera MP4s REAIS (o QC da Fase B analisa-os a sério):
+    // 'good' passa sempre; 'broken-first' parte o primeiro render e passa nos seguintes.
     renderVideo: async (spec, opts) => {
       assert.ok(spec.segments.length > 0, 'renderVideo recebe a Spec re-temporizada');
       assert.ok(opts.outDir.length > 0);
-      return join(opts.outDir, 'final.mp4');
+      calls += 1;
+      const broken = renderMode === 'broken-first' && calls === 1;
+      const total = spec.segments.reduce(
+        (acc, s) => acc + (s.actualDurationSec ?? s.targetDurationSec),
+        0,
+      );
+      const outPath = join(opts.outDir, 'final.mp4');
+      writeTestFixtureMp4(outPath, total, broken);
+      return outPath;
     },
   });
 }
@@ -121,19 +184,25 @@ function makeOrchestrator(
 async function waitForTerminal(
   orch: PipelineOrchestrator,
   id: string,
-  timeoutMs = 15000,
+  timeoutMs = 30000,
 ): Promise<Job> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const job = await orch.getJob(id);
-    if (job.status === 'done' || job.status === 'failed') return job;
+    if (job.status === 'done' || job.status === 'failed' || job.status === 'qc-failed') {
+      return job;
+    }
     if (Date.now() > deadline) throw new Error('timeout à espera do fim do job');
     await new Promise((r) => setTimeout(r, 25));
   }
 }
 
 describe('ciclo de vida completo (topic)', () => {
-  it('topic → spec → approve → render → done, com tts real (mock) e re-timing', async () => {
+  it('topic → spec → approve → render → QC → done, com tts real (mock) e re-timing', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
     const orch = makeOrchestrator(mockRouter(llmSpecJson()));
     const input: PipelineInput = { kind: 'topic', topic: 'hábitos matinais' };
 
@@ -173,6 +242,11 @@ describe('ciclo de vida completo (topic)', () => {
     assert.ok(
       done.outputPath?.endsWith('final.mp4'),
       `outputPath aponta para o MP4 final: ${done.outputPath}`,
+    );
+    // A etapa de QC correu a sério e escreveu o relatório.
+    assert.ok(
+      existsSync(join(jobOutputsDir(done.id), QC_REPORT_FILENAME)),
+      'qc-report.json existe em outputs/<jobId>/',
     );
 
     // DoD da Fase 2: segments[].tts com durações reais + spec re-temporizada.
@@ -470,19 +544,29 @@ describe('i18n end-to-end (idioma → transcrição → LLM → TTS → legendas
     }
   });
 
-  it('job francês: Fase B usa a voz omissa do catálogo (kokoro/ff_siwis)', async () => {
+  it('job francês: Fase B usa a voz omissa do catálogo (edge-tts/fr-FR-DeniseNeural)', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
     const capture: { synth?: { text: string; voice: string; rate: number; provider: string }[] } = { synth: [] };
     const orch = makeOrchestrator(mockRouter(llmSpecJson()), capturingServices(capture));
     const done = await fullCycle(orch, { kind: 'topic', topic: 'bonjour' }, { format: '9:16', language: 'fr' });
     assert.equal(done.status, 'done');
     assert.ok(capture.synth && capture.synth.length > 0);
     for (const s of capture.synth) {
-      assert.equal(s.provider, 'kokoro');
-      assert.equal(s.voice, 'ff_siwis');
+      // Decisão da Joana (2026-10-06): ff_siwis REJEITADA (robótica, sotaque
+      // misto) — a omissão francesa é Edge-TTS fr-FR-DeniseNeural.
+      assert.equal(s.provider, 'edge-tts');
+      assert.equal(s.voice, 'fr-FR-DeniseNeural');
     }
   });
 
-  it('job pt-PT: Fase B usa a voz omissa do catálogo (edge-tts/pt-PT-DuarteNeural)', async () => {
+  it('job pt-PT: Fase B usa a voz omissa do catálogo (edge-tts/pt-PT-DuarteNeural)', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
     const capture: { synth?: { text: string; voice: string; rate: number; provider: string }[] } = { synth: [] };
     const orch = makeOrchestrator(mockRouter(llmSpecJson()), capturingServices(capture));
     const done = await fullCycle(orch, { kind: 'topic', topic: 'olá' }, { format: '9:16', language: 'pt-PT' });
@@ -493,7 +577,11 @@ describe('i18n end-to-end (idioma → transcrição → LLM → TTS → legendas
     }
   });
 
-  it('escolha explícita da UI (ttsChoice) vence o catálogo na Fase B', async () => {
+  it('escolha explícita da UI (ttsChoice) vence o catálogo na Fase B', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
     const capture: { synth?: { text: string; voice: string; rate: number; provider: string }[] } = { synth: [] };
     const orch = makeOrchestrator(mockRouter(llmSpecJson()), capturingServices(capture));
     const done = await fullCycle(
@@ -516,5 +604,212 @@ describe('i18n end-to-end (idioma → transcrição → LLM → TTS → legendas
     const job = await orch.createJob({ kind: 'audio', audioPath }, { format: '9:16', language: 'fr' });
     await orch.generateSpec(job.id);
     assert.deepEqual(capture.transcribeLang, ['fr']);
+  });
+});
+
+describe('etapa de QC (Fase 4)', () => {
+  async function approvedJob(
+    orch: PipelineOrchestrator,
+  ): Promise<{ id: string }> {
+    const created = await orch.createJob(
+      { kind: 'topic', topic: 'hábitos matinais' },
+      { format: '9:16', language: 'pt-PT' },
+    );
+    const spec = await orch.generateSpec(created.id);
+    await orch.approveSpec(created.id, spec);
+    return { id: created.id };
+  }
+
+  function totalDuration(spec: Spec): number {
+    return spec.segments.reduce(
+      (acc, s) => acc + (s.actualDurationSec ?? s.targetDurationSec),
+      0,
+    );
+  }
+
+  it('render partido (silencioso+preto) → qc-failed com motivos pt-PT e eventos qc/qc-failed', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()), undefined, 'broken-first');
+    const { id } = await approvedJob(orch);
+
+    const eventTypes: string[] = [];
+    const unsubscribe = orch.jobStore.subscribe(id, (e) => eventTypes.push(e.type));
+
+    const rendering = await orch.render(id);
+    assert.equal(rendering.status, 'rendering');
+
+    const terminal = await waitForTerminal(orch, id);
+    unsubscribe();
+    assert.equal(terminal.status, 'qc-failed');
+    assert.ok(
+      terminal.error && terminal.error.includes('não passou no controlo de qualidade'),
+      `motivos em pt-PT: ${terminal.error}`,
+    );
+    assert.match(terminal.error ?? '', /silêncio/);
+    assert.match(terminal.error ?? '', /preta/);
+    assert.ok(eventTypes.includes('qc'), `eventos incluem "qc": ${eventTypes.join(',')}`);
+    assert.ok(
+      eventTypes.includes('qc-failed'),
+      `eventos incluem "qc-failed": ${eventTypes.join(',')}`,
+    );
+    assert.ok(
+      existsSync(join(jobOutputsDir(id), QC_REPORT_FILENAME)),
+      'qc-report.json escrito em outputs/<jobId>/',
+    );
+    // O vídeo mau continua referenciado (para o retryQc o reanalisar).
+    assert.ok(terminal.outputPath?.endsWith('final.mp4'));
+  });
+
+  it('retryQc recupera um qc-failed quando o vídeo é corrigido', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()), undefined, 'broken-first');
+    const { id } = await approvedJob(orch);
+    await orch.render(id);
+    const failed = await waitForTerminal(orch, id);
+    assert.equal(failed.status, 'qc-failed');
+    assert.ok(failed.outputPath && failed.spec);
+
+    // A Joana (ou um fix externo) substitui o MP4 por um vídeo bom.
+    writeTestFixtureMp4(failed.outputPath, totalDuration(failed.spec), false);
+
+    const retrying = await orch.retryQc(id);
+    assert.equal(retrying.status, 'qc');
+
+    const done = await waitForTerminal(orch, id);
+    assert.equal(done.status, 'done');
+    assert.equal(done.error, undefined, 'o erro do QC é limpo ao recuperar');
+  });
+
+  it('render a partir de qc-failed recomeça a Fase B completa', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()), undefined, 'broken-first');
+    const { id } = await approvedJob(orch);
+    await orch.render(id);
+    const failed = await waitForTerminal(orch, id);
+    assert.equal(failed.status, 'qc-failed');
+
+    // O segundo render usa o double "bom" — a Fase B corre de novo.
+    const rendering = await orch.render(id);
+    assert.equal(rendering.status, 'rendering');
+    const done = await waitForTerminal(orch, id);
+    assert.equal(done.status, 'done');
+  });
+
+  it('retryQc fora de qc-failed → 409 invalid_state', async () => {
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()));
+    const { id } = await approvedJob(orch);
+    await assert.rejects(() => orch.retryQc(id), (err: unknown) => {
+      assert.ok(err instanceof ApiError);
+      assert.equal(err.code, 'invalid_state');
+      assert.equal(err.httpStatus, 409);
+      return true;
+    });
+  });
+
+  it('render rejeita jobs em estado terminal (failed não re-renderiza)', async () => {
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()));
+    const created = await orch.createJob(
+      { kind: 'topic', topic: 'x' },
+      { format: '9:16', language: 'pt-PT' },
+    );
+    const spec = await orch.generateSpec(created.id);
+    await orch.approveSpec(created.id, spec);
+    orch.jobStore.update(created.id, { status: 'failed', error: 'falha simulada' });
+    await assert.rejects(() => orch.render(created.id), (err: unknown) => {
+      assert.ok(err instanceof ApiError);
+      assert.equal(err.code, 'invalid_state');
+      assert.equal(err.httpStatus, 409);
+      return true;
+    });
+  });
+});
+
+describe('presets de plataforma', () => {
+  it('createJob: preset explícito ganha sobre format e fica guardado no job', async () => {
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()));
+    const job = await orch.createJob(
+      { kind: 'topic', topic: 'x' },
+      { format: '16:9', language: 'pt-PT', preset: 'tiktok' },
+    );
+    assert.equal(job.preset, 'tiktok');
+    assert.equal(job.format, '9:16');
+  });
+
+  it('createJob: sem preset, o format resolve para o preset omisso da proporção', async () => {
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()));
+    const wide = await orch.createJob(
+      { kind: 'topic', topic: 'x' },
+      { format: '16:9', language: 'pt-PT' },
+    );
+    assert.equal(wide.preset, 'youtube-long');
+    assert.equal(wide.format, '16:9');
+    const vertical = await orch.createJob(
+      { kind: 'topic', topic: 'x' },
+      { format: '9:16', language: 'pt-PT' },
+    );
+    assert.equal(vertical.preset, 'youtube-shorts');
+  });
+
+  it('createJob: preset desconhecido → 400 invalid_input', async () => {
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()));
+    await assert.rejects(
+      () =>
+        orch.createJob(
+          { kind: 'topic', topic: 'x' },
+          { format: '9:16', language: 'pt-PT', preset: 'vimeo' as 'tiktok' },
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof ApiError);
+        assert.equal(err.code, 'invalid_input');
+        assert.equal(err.httpStatus, 400);
+        return true;
+      },
+    );
+  });
+
+  it('Fase B: o preset do job chega ao passo de vídeo (renderVideo)', async (t) => {
+    if (!HAVE_QC_TOOLS) {
+      t.skip('ffmpeg/ffprobe indisponíveis — o QC real não pode correr');
+      return;
+    }
+    const seen: { preset?: string | undefined; format?: string | undefined }[] = [];
+    const orch = new PipelineOrchestrator({
+      router: mockRouter(llmSpecJson()),
+      services: mockServices(),
+      serviceManager: fakeServiceManager(),
+      store: new JobStore(),
+      transcriptCacheDir: cacheDir,
+      renderVideo: async (spec, opts) => {
+        seen.push({ preset: opts.preset, format: opts.format });
+        const total = spec.segments.reduce(
+          (acc, s) => acc + (s.actualDurationSec ?? s.targetDurationSec),
+          0,
+        );
+        const outPath = join(opts.outDir, 'final.mp4');
+        writeTestFixtureMp4(outPath, total, false);
+        return outPath;
+      },
+    });
+    const job = await orch.createJob(
+      { kind: 'topic', topic: 'hábitos matinais' },
+      { format: '9:16', language: 'pt-PT', preset: 'instagram-reels' },
+    );
+    const spec = await orch.generateSpec(job.id);
+    await orch.approveSpec(job.id, spec);
+    await orch.render(job.id);
+    const done = await waitForTerminal(orch, job.id);
+    assert.equal(done.status, 'done');
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]!.preset, 'instagram-reels');
+    assert.equal(seen[0]!.format, '9:16');
   });
 });

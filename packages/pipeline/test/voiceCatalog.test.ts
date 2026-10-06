@@ -92,10 +92,33 @@ describe('catalog defaults per language', () => {
     assert.equal(r.voice, 'af_heart');
   });
 
-  it('fr defaults to Kokoro ff_siwis (only French voice in Kokoro-82M)', () => {
+  it('fr defaults to Edge-TTS fr-FR-DeniseNeural (Joana rejected Kokoro ff_siwis, 2026-10-06)', () => {
     const r = resolveTtsForJob({ language: 'fr' });
-    assert.equal(r.provider, 'kokoro');
-    assert.equal(r.voice, 'ff_siwis');
+    assert.equal(r.provider, 'edge-tts');
+    assert.equal(r.voice, 'fr-FR-DeniseNeural');
+  });
+
+  it('ff_siwis survives only as the last local fallback for fr (rejected default, not removed)', () => {
+    const entry = getLanguageEntry('fr');
+    const localFallbacks = entry.fallbackChain.filter((c) => c.provider === 'kokoro');
+    assert.equal(localFallbacks.length, 1);
+    assert.deepEqual(localFallbacks[0], { provider: 'kokoro', voice: 'ff_siwis' });
+    // A omissão já não é local: exceção deliberada ao princípio "omissão
+    // não exige rede" (decisão da Joana — naturalidade acima de offline).
+    assert.notEqual(entry.defaultProvider, 'kokoro');
+  });
+
+  it('pt-PT chain: native neural voices precede any pt-BR voice (naturalness-first, 2026-10-06)', () => {
+    const chain = getLanguageEntry('pt-PT').fallbackChain;
+    const voices = chain.map((c) => `${c.provider}/${c.voice}`);
+    assert.deepEqual(voices, [
+      'edge-tts/pt-PT-DuarteNeural',
+      'edge-tts/pt-PT-RaquelNeural',
+      'google/pt-PT-Neural2-A',
+      'kokoro/pf_dora',
+    ]);
+    const firstPtBr = chain.findIndex((c) => c.provider === 'kokoro');
+    assert.ok(firstPtBr > 0, 'kokoro/pf_dora is the last resort, never before a native neural voice');
   });
 
   it('each language exposes an ordered fallback chain starting at its default', () => {

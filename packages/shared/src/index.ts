@@ -23,12 +23,52 @@ export interface Word {
 export type VideoFormat = '9:16' | '16:9';
 
 /**
+ * Platform presets for the render target. A preset bundles resolution,
+ * caption safe areas, loudness target and platform quirks; it always
+ * implies a `VideoFormat` (see `packages/video/src/presets.ts`).
+ */
+export type PlatformPresetId =
+  | 'tiktok'
+  | 'youtube-shorts'
+  | 'youtube-long'
+  | 'instagram-reels';
+
+/**
+ * Caption/text safe area as fractions (0–1) of the canvas — insets that
+ * keep burned-in text clear of platform UI overlays (action rails,
+ * progress bars, top status bars). Fractions scale with the canvas, so
+ * the same preset works for the full-res render and the low-res preview.
+ */
+export interface SafeArea {
+  /** Top inset (status bar, search/close buttons). */
+  top: number;
+  /** Right inset (like/comment/share action rail on vertical video). */
+  right: number;
+  /** Bottom inset (progress bar, title/channel overlay, nav bar). */
+  bottom: number;
+  /** Left inset (usually small). */
+  left: number;
+}
+
+/**
  * Where a resolved B-roll clip comes from:
  *  - 'pexels' | 'pixabay': stock video via the provider's free API tier;
  *  - 'image': Ken Burns clip (slow zoom/pan) generated locally with FFmpeg;
  *  - 'template': gradient background generated locally (last resort).
  */
 export type BrollProvider = 'pexels' | 'pixabay' | 'image' | 'template';
+
+/**
+ * What to do when a resolved B-roll clip is SHORTER than the segment it
+ * has to cover (ARCHITECTURE.md §7 — the deferred montage decision,
+ * resolved: 'loop' is the default).
+ *  - 'loop': extend the clip by looping it with a smooth crossfade
+ *    between repetitions (FFmpeg xfade) — the default;
+ *  - 'freeze': extend the clip by holding its last frame (FFmpeg tpad
+ *    clone) for the missing time.
+ * Never time-stretch: stretching creates visible artefacts.
+ */
+export type ShortClipStrategy = 'loop' | 'freeze';
 
 /**
  * One timed shot of the final video.
@@ -77,6 +117,14 @@ export interface Segment {
     durationSec: number;
     /** Required attribution, e.g. "Video by X from Pexels" (when any). */
     attribution?: string;
+    /**
+     * Which short-clip strategy was applied to extend this clip to the
+     * segment duration (only set when the source clip was shorter than
+     * needed and an extension was actually generated). Absent means the
+     * clip already covered the segment (or the fit failed and the honest
+     * short clip was kept).
+     */
+    shortClipStrategy?: ShortClipStrategy;
   };
   /** Real shot duration after re-timing with TTS word timestamps (Phase B). */
   actualDurationSec?: number;

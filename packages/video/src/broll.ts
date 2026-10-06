@@ -20,11 +20,18 @@
  *    (logged, never thrown) — every segment ALWAYS ends with a valid
  *    `broll` entry, never without visuals;
  *  - clip durations are recorded honestly: the renderer trims longer
- *    clips and loops/freezes shorter ones (a montage decision, not made
- *    here).
+ *    clips; shorter ones are extended by the short-clip fit — smooth loop
+ *    with crossfade by default ('loop'), last-frame hold when the project
+ *    opts into 'freeze' (ResolveBrollOptions.shortClipStrategy);
+ *  - relevance scoring (scoreCandidate) is synonym-aware: keyword terms
+ *    are expanded with curated synonyms/related terms and singular stems,
+ *    matched against provider tags ∪ page-URL slug tokens ∪ matched
+ *    query tokens; each provider is searched with 2–3 query variants
+ *    whose candidates are merged and deduped before scoring.
  *
  * Everything that needs the network or FFmpeg is injectable or guarded so
- * the pure parts (scoring, selection, registry) are fully unit-testable.
+ * the pure parts (scoring, selection, registry, arg builders) are fully
+ * unit-testable.
  */
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
@@ -33,11 +40,11 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline as streamPipeline } from 'node:stream/promises';
-import type { BrollProvider, Segment, VideoFormat } from '@shorts-forge/shared';
+import type { BrollProvider, Segment, ShortClipStrategy, VideoFormat } from '@shorts-forge/shared';
 
 // ── Public shapes ────────────────────────────────────────────────────
 
-export type { BrollProvider };
+export type { BrollProvider, ShortClipStrategy };
 
 /** One stock-video candidate returned by Pexels/Pixabay. */
 export interface BrollCandidate {
@@ -79,11 +86,51 @@ export interface ResolveBrollOptions {
   requestTimeoutMs?: number;
   /** FFmpeg binary. Default: "ffmpeg" from PATH. */
   ffmpegPath?: string;
+  /**
+   * What to do when a stock clip is SHORTER than the segment it must
+   * cover. Default: 'loop' (smooth loop with crossfade — the resolved
+   * default of the ARCHITECTURE.md §7 open decision). Set to 'freeze'
+   * per project to hold the last frame instead. Reversible: the source
+   * clip stays untouched in the cache and re-resolving with the other
+   * strategy produces a different cached file.
+   */
+  shortClipStrategy?: ShortClipStrategy | undefined;
 }
 
 export type ResolvedBroll = NonNullable<Segment['broll']>;
 
 // ── Scoring ──────────────────────────────────────────────────────────
+//
+// Scoring v2 — relevance goes beyond raw keyword/tag overlap:
+//
+//   relevance (55% of total)
+//     = 0.70 * weightedOverlap(expanded visualKeywords, candidateText)
+//     + 0.30 * weightedOverlap(expanded brollDescription, candidateText)
+//
+//   where each segment term is expanded to:
+//     - the term itself            → weight 1.0
+//     - a naive singular stem      → weight 0.9  ("cities" → "city")
+//     - curated synonyms/related   → weight 0.7  ("sunrise" → "dawn")
+//
+//   and each term scores against the candidate's text by best match:
+//     exact token equality → 1.0, substring/prefix either way → 0.6,
+//     no match → 0.0. The candidate text is the UNION of the provider's
+//   own tags (Pixabay), the matched search-query tokens (Pexels, which
+//   returns no tags — the engine already did the semantic matching) and
+//   tokens scraped from the provider's page-URL slug (both providers,
+//   e.g. pixabay.com/videos/sunrise-city-770/).
+//
+//   durationFit (35%) and orientation (10%) are unchanged from v1:
+//   longer clips trim cheaply (1.0 → 0.7 at 2× length); shorter clips
+//   score proportionally up to 0.75 (they must be extended, visibly
+//   worse than trimming); orientation match is 1.0, mismatch 0.0
+//   (0.25 for a portrait clip in a 16:9 video, which crops acceptably).
+//
+// Why these weights: relevance dominates because a wrong-but-fitting
+// clip is worse than a right-but-short one (short clips are now
+// extended smoothly by the shortClipStrategy fit); duration matters
+// next because trimming is free while extending costs a re-encode;
+// orientation is a tiebreaker (the renderer crops anyway).
 
 const STOPWORDS = new Set(
   'a,an,the,and,or,but,of,to,in,on,at,for,with,from,by,as,is,are,was,were,be,been,being,it,its,this,that,these,those,i,you,he,she,we,they,them,his,her,their,our,your,my,me,him,us,not,no,do,does,did,will,would,can,could,should,very,just,so,such,into,over,after,before,between,through,during,about,above,below,up,down,out,off,again,once,here,there,when,where,why,how,all,any,both,each,few,more,most,other,some,only,own,same,than,too'.split(
@@ -98,30 +145,182 @@ function tokenize(text: string): string[] {
     .filter((t) => t.length > 2 && !STOPWORDS.has(t));
 }
 
-/** Fraction of `needles` found (exact or substring) inside `haystack`. */
-function overlap(needles: string[], haystack: string[]): number {
-  if (needles.length === 0) return 0.5; // neutral: nothing to match against
-  let hits = 0;
-  for (const n of needles) {
-    if (haystack.some((h) => h === n || h.includes(n) || n.includes(h))) hits += 1;
+/**
+ * Curated English synonyms / closely-related terms for common B-roll
+ * subjects. `visualKeywords` from the LLM are ALWAYS English (see
+ * ARCHITECTURE.md §2), so a single English map covers every language of
+ * narration. Deliberately small and video-oriented — a full thesaurus
+ * would add noise; these are terms stock libraries actually tag with.
+ */
+const SYNONYMS: Record<string, string[]> = {
+  sunrise: ['dawn', 'morning', 'daybreak'],
+  sunset: ['dusk', 'sundown', 'evening'],
+  city: ['urban', 'downtown', 'metropolis', 'skyline', 'cityscape'],
+  town: ['village', 'urban'],
+  beach: ['seaside', 'coast', 'shore'],
+  ocean: ['sea', 'waves', 'water'],
+  sea: ['ocean', 'waves', 'water'],
+  mountain: ['peak', 'summit', 'hill', 'alps'],
+  forest: ['woods', 'trees', 'jungle'],
+  river: ['stream', 'water'],
+  lake: ['water'],
+  waterfall: ['falls', 'water'],
+  desert: ['dunes', 'sand'],
+  sky: ['clouds'],
+  clouds: ['sky'],
+  rain: ['rainfall', 'storm', 'drops'],
+  snow: ['winter', 'snowfall'],
+  storm: ['rain', 'thunder', 'lightning'],
+  fire: ['flames', 'blaze', 'bonfire'],
+  water: ['ocean', 'sea', 'river', 'drops'],
+  coffee: ['espresso', 'cafe'],
+  food: ['meal', 'cooking', 'cuisine', 'dish'],
+  breakfast: ['morning', 'food', 'coffee'],
+  gym: ['workout', 'fitness', 'exercise', 'training'],
+  running: ['run', 'jog', 'sprint'],
+  yoga: ['meditation', 'mindfulness', 'stretch'],
+  meditation: ['mindfulness', 'yoga', 'calm'],
+  office: ['workplace', 'business', 'desk', 'work'],
+  meeting: ['conference', 'discussion'],
+  team: ['group', 'people', 'collaboration'],
+  family: ['home', 'parents', 'children'],
+  baby: ['infant', 'newborn'],
+  dog: ['puppy', 'pet'],
+  cat: ['kitten', 'pet'],
+  car: ['vehicle', 'automobile', 'drive', 'road'],
+  road: ['highway', 'street', 'journey', 'travel'],
+  travel: ['journey', 'trip', 'adventure', 'tourism'],
+  airplane: ['plane', 'flight', 'airport'],
+  business: ['corporate', 'office', 'success'],
+  money: ['cash', 'finance', 'wealth', 'investment'],
+  phone: ['smartphone', 'mobile', 'call'],
+  computer: ['laptop', 'technology', 'screen', 'keyboard'],
+  music: ['concert', 'song', 'guitar', 'piano'],
+  dance: ['dancing', 'party'],
+  wedding: ['bride', 'marriage', 'celebration'],
+  party: ['celebration', 'festival', 'event'],
+  fireworks: ['celebration', 'night', 'party'],
+  night: ['evening', 'dark', 'nightlife'],
+  morning: ['dawn', 'sunrise', 'breakfast'],
+  garden: ['plants', 'flowers', 'nature'],
+  flower: ['bloom', 'blossom', 'garden'],
+  tree: ['forest', 'nature', 'woods'],
+  bird: ['flying', 'wings', 'nature'],
+  crowd: ['people', 'audience', 'gathering'],
+  audience: ['crowd', 'people', 'concert'],
+  stage: ['concert', 'performance', 'theater'],
+  book: ['reading', 'library', 'study'],
+  school: ['education', 'classroom', 'learning', 'students'],
+  doctor: ['medical', 'hospital', 'health'],
+  sport: ['sports', 'game', 'competition', 'athlete'],
+  football: ['soccer', 'sport', 'stadium'],
+  swimming: ['pool', 'water', 'swim'],
+  space: ['stars', 'galaxy', 'cosmos', 'universe'],
+  stars: ['night', 'sky', 'space'],
+  moon: ['night', 'lunar'],
+  sun: ['daylight', 'sunshine', 'bright'],
+  light: ['bright', 'glow', 'lamp'],
+  timelapse: ['hyperlapse', 'fast', 'motion'],
+  aerial: ['drone', 'sky', 'view', 'landscape'],
+  drone: ['aerial', 'flight', 'sky'],
+  landscape: ['scenery', 'nature', 'view', 'mountains'],
+  abstract: ['background', 'pattern', 'texture', 'gradient'],
+  background: ['abstract', 'backdrop', 'texture'],
+  texture: ['pattern', 'abstract', 'surface'],
+  vintage: ['retro', 'old', 'classic'],
+  modern: ['contemporary', 'new', 'sleek'],
+  luxury: ['elegant', 'premium', 'rich'],
+  minimal: ['simple', 'clean', 'minimalism'],
+  colorful: ['vibrant', 'vivid', 'colors'],
+  portrait: ['face', 'person', 'people'],
+};
+
+/** Naive English singularization so plural tags match singular keywords. */
+function stem(token: string): string {
+  if (token.endsWith('ies') && token.length > 4) return token.slice(0, -3) + 'y';
+  if (token.endsWith('es') && token.length > 5 && /(s|x|z|ch|sh)es$/.test(token)) {
+    return token.slice(0, -2);
   }
-  return hits / needles.length;
+  if (token.endsWith('s') && token.length > 3 && !token.endsWith('ss')) {
+    return token.slice(0, -1);
+  }
+  return token;
+}
+
+interface WeightedTerm {
+  term: string;
+  weight: number;
+}
+
+/** Expands raw tokens into weighted terms (exact 1.0 / stem 0.9 / synonym 0.7). */
+function expandTerms(tokens: string[], baseWeight: number): WeightedTerm[] {
+  const out: WeightedTerm[] = [];
+  const seen = new Set<string>();
+  const push = (term: string, weight: number): void => {
+    const key = `${term}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ term, weight });
+  };
+  for (const t of tokens) {
+    push(t, baseWeight);
+    const s = stem(t);
+    if (s !== t) push(s, baseWeight * 0.9);
+    for (const syn of SYNONYMS[t] ?? []) push(syn, baseWeight * 0.7);
+  }
+  return out;
+}
+
+/** Best match of one term against the candidate token set. */
+function termMatch(term: string, haystack: Set<string>): number {
+  if (haystack.has(term)) return 1;
+  for (const h of haystack) {
+    if (h.startsWith(term) || term.startsWith(h) || h.includes(term) || term.includes(h)) {
+      return 0.6;
+    }
+  }
+  return 0;
+}
+
+/** Weight-normalized overlap in [0, 1]; 0.5 when there is nothing to match. */
+function weightedOverlap(terms: WeightedTerm[], haystack: Set<string>): number {
+  let num = 0;
+  let den = 0;
+  for (const { term, weight } of terms) {
+    den += weight;
+    num += weight * termMatch(term, haystack);
+  }
+  return den === 0 ? 0.5 : num / den;
 }
 
 /**
- * Scores one candidate for a segment.
- *
- * Heuristic (documented so it can be tuned, not magic):
- *  - relevance (55%): 60% keyword↔tag overlap + 40% brollDescription↔tag
- *    overlap. Tags are the provider's own tags (Pixabay) or the matched
- *    query tokens (Pexels, which returns no tags — the search engine
- *    already did the semantic matching).
- *  - durationFit (35%): clips >= neededSec score 1.0 for an exact match,
- *    decaying to 0.7 at 2× the needed length (longer is trimmed, so excess
- *    is cheap but wasteful); shorter clips score proportionally up to
- *    0.75 (they must loop, which is visibly worse than trimming).
- *  - orientation (10%): 1.0 when the clip's orientation matches the
- *    output format, 0.0/0.25 otherwise.
+ * Descriptive tokens scraped from a provider page URL slug, e.g.
+ * "https://pixabay.com/videos/sunrise-city-skyline-770/" → sunrise, city,
+ * skyline. Pure numeric path segments (ids) and short tokens are dropped.
+ * Both Pexels and Pixabay page URLs carry these slugs, so this is free
+ * provider metadata the raw tag lists miss.
+ */
+export function tokensFromPageUrl(pageUrl: string): string[] {
+  let path = '';
+  try {
+    path = new URL(pageUrl).pathname;
+  } catch {
+    path = pageUrl;
+  }
+  return path
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 2 && !STOPWORDS.has(t) && !/^\d+$/.test(t));
+}
+
+/** The full text signal for a candidate: tags ∪ page-slug tokens. */
+function candidateTextTokens(candidate: BrollCandidate): Set<string> {
+  return new Set([...candidate.tags.flatMap(tokenize), ...tokensFromPageUrl(candidate.pageUrl)]);
+}
+
+/**
+ * Scores one candidate for a segment. See the "Scoring v2" block comment
+ * above for the documented formula.
  */
 export function scoreCandidate(
   candidate: BrollCandidate,
@@ -129,10 +328,12 @@ export function scoreCandidate(
   neededSec: number,
   format: VideoFormat,
 ): CandidateScore {
-  const tagTokens = candidate.tags.flatMap(tokenize);
+  const text = candidateTextTokens(candidate);
   const kwTokens = segment.visualKeywords.flatMap(tokenize);
   const descTokens = tokenize(segment.brollDescription);
-  const relevance = 0.6 * overlap(kwTokens, tagTokens) + 0.4 * overlap(descTokens, tagTokens);
+  const kwScore = weightedOverlap(expandTerms(kwTokens, 1), text);
+  const descScore = weightedOverlap(expandTerms(descTokens, 1), text);
+  const relevance = 0.7 * kwScore + 0.3 * descScore;
 
   const needed = Math.max(neededSec, 0.5);
   const dur = Math.max(candidate.durationSec, 0);
@@ -210,6 +411,38 @@ export function buildSearchQuery(segment: Pick<Segment, 'visualKeywords' | 'brol
   return tokenize(segment.brollDescription).slice(0, 6).join(' ') || 'abstract background';
 }
 
+/**
+ * Builds 2–3 query variants for one segment so multi-query merging can
+ * widen recall before scoring narrows it back down:
+ *   1. primary: the top-3 visual keywords (as buildSearchQuery);
+ *   2. synonym variant: each keyword swapped for its first known synonym
+ *      (e.g. "sunrise city timelapse" → "dawn urban hyperlapse");
+ *   3. description-led: top tokens of brollDescription (a different angle
+ *      on the same shot, often phrased like a stock-library caption).
+ * Variants that collapse to the primary (no synonyms known, description
+ * already covered) are dropped, so a segment with no expansion data still
+ * yields exactly one query — never an empty or duplicate one.
+ */
+export function buildQueryVariants(
+  segment: Pick<Segment, 'visualKeywords' | 'brollDescription'>,
+): string[] {
+  const primary = buildSearchQuery(segment);
+  const variants = [primary];
+  const kws = segment.visualKeywords.map((k) => k.trim().toLowerCase()).filter(Boolean);
+  if (kws.length > 0) {
+    const synQuery = kws
+      .slice(0, 3)
+      .map((k) => SYNONYMS[k]?.[0] ?? k)
+      .join(' ');
+    if (synQuery !== primary && !variants.includes(synQuery)) variants.push(synQuery);
+  }
+  const descQuery = tokenize(segment.brollDescription).slice(0, 4).join(' ');
+  if (descQuery !== '' && descQuery !== primary && !variants.includes(descQuery)) {
+    variants.push(descQuery);
+  }
+  return variants.slice(0, 3);
+}
+
 /** Picks the smallest mp4 rendition >= target width, else the largest. */
 function pickPexelsFile(files: PexelsVideoFile[], wantWidth: number): PexelsVideoFile | null {
   const mp4 = files.filter((f) => f.file_type === 'video/mp4' && f.link && (f.width ?? 0) > 0);
@@ -243,6 +476,13 @@ interface SearchDeps {
   timeoutMs: number;
 }
 
+export interface SearchQueryOptions {
+  /** Override the query built from the segment (used by multi-query variants). */
+  query?: string | undefined;
+  /** Results per variant. Default 15 (first variant), 10 (later variants). */
+  perPage?: number | undefined;
+}
+
 /**
  * REAL: Pexels video search (free tier). Throws on HTTP/network errors so
  * the cascade can fall through; never returns partial data silently.
@@ -252,12 +492,14 @@ export async function searchPexels(
   apiKey: string,
   format: VideoFormat,
   deps: SearchDeps,
+  queryOpts?: SearchQueryOptions,
 ): Promise<BrollCandidate[]> {
+  const query = queryOpts?.query ?? buildSearchQuery(segment);
   const params = new URLSearchParams({
-    query: buildSearchQuery(segment),
+    query,
     orientation: format === '9:16' ? 'portrait' : 'landscape',
     size: 'medium',
-    per_page: '15',
+    per_page: String(queryOpts?.perPage ?? 15),
   });
   const res = await deps.fetchImpl(`${PEXELS_SEARCH_URL}?${params.toString()}`, {
     headers: { Authorization: apiKey },
@@ -279,8 +521,9 @@ export async function searchPexels(
       durationSec: v.duration ?? 0,
       width: file.width ?? v.width ?? 0,
       height: file.height ?? v.height ?? 0,
-      // Pexels returns no tags; the matched query tokens are the signal.
-      tags: tokenize(buildSearchQuery(segment)),
+      // Pexels returns no tags; the matched query tokens are the signal
+      // (plus page-slug tokens, picked up at scoring time).
+      tags: tokenize(query),
       attribution: 'Video from Pexels',
     });
   }
@@ -296,11 +539,13 @@ export async function searchPixabay(
   apiKey: string,
   format: VideoFormat,
   deps: SearchDeps,
+  queryOpts?: SearchQueryOptions,
 ): Promise<BrollCandidate[]> {
+  const query = queryOpts?.query ?? buildSearchQuery(segment);
   const params = new URLSearchParams({
     key: apiKey,
-    q: buildSearchQuery(segment),
-    per_page: '15',
+    q: query,
+    per_page: String(queryOpts?.perPage ?? 15),
     safesearch: 'true',
     order: 'popular',
   });
@@ -328,6 +573,71 @@ export async function searchPixabay(
     });
   }
   return out;
+}
+
+// ── Multi-query merging ──────────────────────────────────────────────
+
+/**
+ * Runs every query variant from buildQueryVariants() against one
+ * provider, merges the candidate lists and dedupes by clipId (unioning
+ * tags, so a clip found by two variants keeps both query signals).
+ * Variants run sequentially to stay gentle on free-tier quotas; the
+ * later variants ask for fewer results (10 vs 15) for the same reason.
+ *
+ * Failure semantics: a failure on the FIRST variant throws (auth errors
+ * and outages must fail fast so the cascade falls through to the next
+ * provider); a failure on a LATER variant keeps the candidates gathered
+ * so far (a 429 mid-way degrades recall, never the whole provider).
+ */
+async function searchMultiVariant(
+  segment: Pick<Segment, 'visualKeywords' | 'brollDescription'>,
+  searchOne: (query: string, perPage: number) => Promise<BrollCandidate[]>,
+): Promise<BrollCandidate[]> {
+  const variants = buildQueryVariants(segment);
+  const byId = new Map<string, BrollCandidate>();
+  for (let i = 0; i < variants.length; i++) {
+    const query = variants[i]!;
+    let cands: BrollCandidate[];
+    try {
+      cands = await searchOne(query, i === 0 ? 15 : 10);
+    } catch (err) {
+      if (i === 0) throw err;
+      break; // later variant failed (e.g. 429): keep what we have
+    }
+    for (const c of cands) {
+      const prev = byId.get(c.clipId);
+      if (prev) {
+        prev.tags = [...new Set([...prev.tags, ...c.tags])];
+      } else {
+        byId.set(c.clipId, c);
+      }
+    }
+  }
+  return [...byId.values()];
+}
+
+/** Multi-query Pexels search: variants merged + deduped (see searchMultiVariant). */
+export async function searchPexelsMulti(
+  segment: Pick<Segment, 'visualKeywords' | 'brollDescription'>,
+  apiKey: string,
+  format: VideoFormat,
+  deps: SearchDeps,
+): Promise<BrollCandidate[]> {
+  return searchMultiVariant(segment, (query, perPage) =>
+    searchPexels(segment, apiKey, format, deps, { query, perPage }),
+  );
+}
+
+/** Multi-query Pixabay search: variants merged + deduped (see searchMultiVariant). */
+export async function searchPixabayMulti(
+  segment: Pick<Segment, 'visualKeywords' | 'brollDescription'>,
+  apiKey: string,
+  format: VideoFormat,
+  deps: SearchDeps,
+): Promise<BrollCandidate[]> {
+  return searchMultiVariant(segment, (query, perPage) =>
+    searchPixabay(segment, apiKey, format, deps, { query, perPage }),
+  );
 }
 
 // ── No-repeat registry ───────────────────────────────────────────────
@@ -649,6 +959,154 @@ export async function ensureTemplateClip(
   return ok && (await fileExists(outMp4)) ? outMp4 : null;
 }
 
+// ── Short-clip fit: loop-with-crossfade (default) / freeze ──────────
+//
+// Resolves the ARCHITECTURE.md §7 deferred decision: when a stock clip
+// is SHORTER than its segment, the default is a SMOOTH LOOP WITH
+// CROSSFADE ('loop'), configurable per project to 'freeze' via
+// ResolveBrollOptions.shortClipStrategy. Never time-stretch (artefacts).
+// The source clip stays untouched in the cache; the fitted clip is a
+// deterministic cache derivative, so the choice is fully reversible by
+// re-resolving with the other strategy.
+
+/** Gaps smaller than this are not worth a re-encode. */
+const SHORT_CLIP_EPS = 0.05;
+
+function fmtSec(n: number): string {
+  return String(parseFloat(n.toFixed(3)));
+}
+
+/**
+ * Builds the FFmpeg args for a smooth loop with crossfade. Pure.
+ *
+ * Technique: the clip is repeated `repeats` times; consecutive copies
+ * are joined with xfade (fade transition). The fade duration is
+ * min(0.5s, clipDur/4) — long enough to hide the loop point, short
+ * enough to never eat the clip. Offsets are cumulative:
+ *   offset_k = k * clipDur - k * fadeDur   (k = 1..repeats-1)
+ * so each joint lands exactly at a copy boundary minus the fade.
+ * The chain is trimmed to exactly targetDurationSec.
+ * Audio is dropped (-an): B-roll always plays muted in the composition.
+ */
+export function buildSmoothLoopArgs(opts: {
+  inputPath: string;
+  outPath: string;
+  clipDurationSec: number;
+  targetDurationSec: number;
+  fps?: number;
+  ffmpegPath?: string;
+}): string[] {
+  const ff = opts.ffmpegPath ?? 'ffmpeg';
+  const fps = opts.fps ?? 30;
+  const d = opts.clipDurationSec;
+  const T = opts.targetDurationSec;
+  const fade = Math.min(0.5, d / 4);
+  const repeats = Math.max(2, Math.ceil((T - fade) / (d - fade)));
+
+  const splits = Array.from({ length: repeats }, (_, i) => `[s${i}]`).join('');
+  let chain = `[0:v]fps=${fps},format=yuv420p,split=${repeats}${splits}`;
+  let prev = '[s0]';
+  for (let k = 1; k < repeats; k++) {
+    const offset = fmtSec(k * d - k * fade);
+    const out = k === repeats - 1 ? '[xfin]' : `[x${k}]`;
+    chain += `;${prev}[s${k}]xfade=transition=fade:duration=${fmtSec(fade)}:offset=${offset}${out}`;
+    prev = out;
+  }
+  chain += `;[xfin]trim=0:${fmtSec(T)},setpts=PTS-STARTPTS,format=yuv420p[vout]`;
+
+  return [
+    ff, '-y',
+    '-i', opts.inputPath,
+    '-filter_complex', chain,
+    '-map', '[vout]',
+    '-an',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+    '-movflags', '+faststart',
+    opts.outPath,
+  ];
+}
+
+/**
+ * Builds the FFmpeg args for a freeze fit: the clip plays once, then its
+ * LAST frame is held (tpad stop_mode=clone) for the missing time, up to
+ * exactly targetDurationSec. Pure. Audio is dropped (-an), same as loop.
+ */
+export function buildFreezeFrameArgs(opts: {
+  inputPath: string;
+  outPath: string;
+  clipDurationSec: number;
+  targetDurationSec: number;
+  fps?: number;
+  ffmpegPath?: string;
+}): string[] {
+  const ff = opts.ffmpegPath ?? 'ffmpeg';
+  const fps = opts.fps ?? 30;
+  const gap = Math.max(0, opts.targetDurationSec - opts.clipDurationSec);
+  const vf =
+    `fps=${fps},tpad=stop_mode=clone:stop_duration=${fmtSec(gap)},` +
+    `format=yuv420p`;
+  return [
+    ff, '-y',
+    '-i', opts.inputPath,
+    '-vf', vf,
+    '-t', fmtSec(opts.targetDurationSec),
+    '-an',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+    '-movflags', '+faststart',
+    opts.outPath,
+  ];
+}
+
+export interface FitShortClipDeps {
+  ffmpegPath: string;
+  log?: ((m: string) => void) | undefined;
+  fps?: number;
+}
+
+/**
+ * REAL: extends a too-short stock clip to `neededSec` with FFmpeg —
+ * 'loop' (default) chains crossfaded repetitions, 'freeze' holds the
+ * last frame. The fitted clip is cached deterministically
+ * (`fit-<strategy>-<clipId>-<needed>s.mp4`) and returned with the honest
+ * duration (== neededSec).
+ *
+ * Returns null on ANY failure (FFmpeg missing/broken, degenerate
+ * durations) — the caller then keeps the original short clip with its
+ * honest duration, so the never-empty cascade guarantee holds.
+ */
+export async function fitShortClip(
+  clipPath: string,
+  clipDurationSec: number,
+  neededSec: number,
+  strategy: ShortClipStrategy,
+  cacheDir: string,
+  baseClipId: string,
+  deps: FitShortClipDeps,
+): Promise<{ localPath: string; durationSec: number } | null> {
+  try {
+    if (!ffmpegAvailable(deps.ffmpegPath)) {
+      deps.log?.('FFmpeg not found — keeping the short clip as-is.');
+      return null;
+    }
+    const d = clipDurationSec;
+    const T = neededSec;
+    if (!(d > 0.2) || !(T > d + SHORT_CLIP_EPS)) return null;
+    const outPath = cachePathFor(cacheDir, `fit-${strategy}-${baseClipId}-${T.toFixed(1)}s`);
+    if (await fileExists(outPath)) return { localPath: outPath, durationSec: T }; // cache hit
+    const fps = deps.fps ?? 30;
+    const args =
+      strategy === 'loop'
+        ? buildSmoothLoopArgs({ inputPath: clipPath, outPath, clipDurationSec: d, targetDurationSec: T, fps, ffmpegPath: deps.ffmpegPath })
+        : buildFreezeFrameArgs({ inputPath: clipPath, outPath, clipDurationSec: d, targetDurationSec: T, fps, ffmpegPath: deps.ffmpegPath });
+    if (!runFfmpeg(args, deps.ffmpegPath, deps.log)) return null;
+    if (!(await fileExists(outPath))) return null;
+    return { localPath: outPath, durationSec: T };
+  } catch (err) {
+    deps.log?.(`short-clip fit (${strategy}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
 // ── The cascade ──────────────────────────────────────────────────────
 
 function neededDuration(segment: Segment): number {
@@ -681,26 +1139,50 @@ async function tryApiSource(
   try {
     const candidates =
       source === 'pexels'
-        ? await searchPexels(segment, apiKey, o.format, deps)
-        : await searchPixabay(segment, apiKey, o.format, deps);
+        ? await searchPexelsMulti(segment, apiKey, o.format, deps)
+        : await searchPixabayMulti(segment, apiKey, o.format, deps);
     const best = selectBestCandidate(candidates, registry.ids, segment, needed, o.format);
     if (!best) {
       o.log?.(`${source}: no unused candidate matched — falling through.`);
       return null;
     }
-    const localPath = cachePathFor(o.cacheDir, best.clipId);
-    const downloaded = await downloadToCache(best.url, localPath, { ...deps, log: o.log });
+    const basePath = cachePathFor(o.cacheDir, best.clipId);
+    const downloaded = await downloadToCache(best.url, basePath, { ...deps, log: o.log });
     if (!downloaded) return null; // fall through: never hand out a broken clip
     await registry.mark(best.clipId);
+
+    // Clip shorter than the segment? Extend it (default: smooth loop with
+    // crossfade). A failed fit falls back to the honest short clip —
+    // never empty, never stretched.
+    let localPath = basePath;
+    let durationSec = best.durationSec;
+    let shortClipStrategy: ShortClipStrategy | undefined;
+    const strategy: ShortClipStrategy = o.shortClipStrategy ?? 'loop';
+    if (best.durationSec < needed - SHORT_CLIP_EPS) {
+      const fit = await fitShortClip(basePath, best.durationSec, needed, strategy, o.cacheDir, best.clipId, {
+        ffmpegPath: o.ffmpegPath,
+        log: o.log,
+      });
+      if (fit) {
+        localPath = fit.localPath;
+        durationSec = fit.durationSec;
+        shortClipStrategy = strategy;
+        o.log?.(`${source}: short clip ${best.clipId} extended via ${strategy} to ${durationSec.toFixed(1)}s.`);
+      } else {
+        o.log?.(`${source}: short-clip fit (${strategy}) failed for ${best.clipId} — keeping the short clip as-is.`);
+      }
+    }
+
     const entry: ResolvedBroll = {
       provider: source,
       clipId: best.clipId,
       url: best.url,
-      durationSec: best.durationSec,
+      durationSec,
       attribution: best.attribution,
       localPath,
+      ...(shortClipStrategy !== undefined ? { shortClipStrategy } : {}),
     };
-    o.log?.(`${source}: resolved ${best.clipId} (${best.durationSec}s) for ${segment.id}.`);
+    o.log?.(`${source}: resolved ${best.clipId} (${durationSec.toFixed(1)}s) for ${segment.id}.`);
     return entry;
   } catch (err) {
     // Graceful degradation: log and fall through the cascade.

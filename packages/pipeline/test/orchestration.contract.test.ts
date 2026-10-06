@@ -33,17 +33,23 @@ const FROZEN_JOB_STATUSES = [
   'spec-draft',
   'awaiting-approval',
   'rendering',
+  // Fase 4 (QC automático): extensão intencional do contrato da Fase 1,
+  // documentada em ARCHITECTURE.md §8.
+  'qc',
+  'qc-failed',
   'done',
   'failed',
 ] as const;
 type JobStatus = (typeof FROZEN_JOB_STATUSES)[number];
 
-/** Tipos de evento SSE do contrato congelado (§8 + JobEventType da UI). */
+/** Tipos de evento SSE do contrato (§8 + JobEventType da UI). */
 const FROZEN_EVENT_TYPES = [
   'progress',
   'spec-draft',
   'awaiting-approval',
   'rendering',
+  'qc',
+  'qc-failed',
   'done',
   'failed',
 ] as const;

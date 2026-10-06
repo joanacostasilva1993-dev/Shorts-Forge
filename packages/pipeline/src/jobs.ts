@@ -1,8 +1,10 @@
 /**
  * Job model + in-memory store + event bus for the pipeline orchestrator.
  *
- * A Job is the unit of work the UI drives through the frozen REST contract
- * (ARCHITECTURE.md §8): create → Phase A (spec) → approve → Phase B (render).
+ * A Job is the unit of work the UI drives through the REST contract
+ * (ARCHITECTURE.md §8): create → Phase A (spec) → approve → Phase B
+ * (render) → QC (automatic) → done. `qc-failed` jobs can retry QC or
+ * re-render; `/download` refuses to serve them (409).
  * Events are fanned out to SSE subscribers (`GET /api/jobs/:id/events`)
  * and to programmatic `AsyncIterable` consumers (`Pipeline.specEvents`).
  *
@@ -12,21 +14,42 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { PipelineInput, Spec, VideoFormat } from '@shorts-forge/shared';
+import type {
+  PipelineInput,
+  PlatformPresetId,
+  ShortClipStrategy,
+  Spec,
+  VideoFormat,
+} from '@shorts-forge/shared';
 
-/** Lifecycle states of a pipeline job (frozen contract — ARCHITECTURE.md §8). */
+/**
+ * Lifecycle states of a pipeline job.
+ *
+ * Extended in Phase 4 (QC stage): `qc` / `qc-failed` were added to the
+ * Phase 1 frozen contract — see ARCHITECTURE.md §8 for the documented
+ * extension and its rationale.
+ */
 export type JobStatus =
   | 'spec-draft'
   | 'awaiting-approval'
   | 'rendering'
+  | 'qc'
+  | 'qc-failed'
   | 'done'
   | 'failed';
 
-/** SSE event types (frozen contract — ARCHITECTURE.md §8). */
+/**
+ * SSE event types.
+ *
+ * Extended in Phase 4 alongside JobStatus (`qc` progress, `qc-failed`
+ * terminal). Documented in ARCHITECTURE.md §8.
+ */
 export type JobEventType =
   | 'spec-draft'
   | 'awaiting-approval'
   | 'rendering'
+  | 'qc'
+  | 'qc-failed'
   | 'done'
   | 'failed'
   | 'progress';
@@ -43,9 +66,12 @@ export interface JobTtsChoice {
 
 /**
  * A pipeline job. `format`/`language` come from `POST /api/jobs` and travel
- * with the job so Phase A/B stay consistent. `ttsChoice` carries the UI's
- * explicit voice choice (StepVoice); when absent, Phase B resolves the
- * voice from the language catalog (packages/tts/voices.catalog.json).
+ * with the job so Phase A/B stay consistent. `preset` is the resolved
+ * platform preset (TikTok, YouTube Shorts, …): an explicit `preset` in
+ * `POST /api/jobs` wins over `format`; otherwise the preset is defaulted
+ * from the format. `ttsChoice` carries the UI's explicit voice choice
+ * (StepVoice); when absent, Phase B resolves the voice from the language
+ * catalog (packages/tts/voices.catalog.json).
  * `outputPath` is set by the Phase 4 video assembly (unset until then —
  * `/download` 409s honestly).
  */
@@ -55,15 +81,25 @@ export interface Job {
   input: PipelineInput;
   format: VideoFormat;
   language: string;
+  /** Resolved platform preset — always set at creation (see orchestrate.createJob). */
+  preset: PlatformPresetId;
   /** Explicit per-job TTS choice from the UI (optional). */
   ttsChoice?: JobTtsChoice;
+  /**
+   * Per-project short-clip strategy for B-roll (optional). When set,
+   * Phase B extends stock clips shorter than their segment with this
+   * strategy; when absent, the B-roll resolver's default applies
+   * ('loop' — smooth loop with crossfade). Settable at job creation
+   * via `POST /api/jobs { shortClipStrategy }`.
+   */
+  shortClipStrategy?: ShortClipStrategy;
   spec?: Spec;
   /** 0..1 overall progress. */
   progress: number;
-  /** pt-PT failure reason (only when status === 'failed'). */
-  error?: string;
+  /** pt-PT failure reason (only when status is 'failed' or 'qc-failed'). */
+  error?: string | undefined;
   /** Absolute path of the final MP4 (Phase 4). */
-  outputPath?: string;
+  outputPath?: string | undefined;
   createdAt: string;
   updatedAt: string;
 }
@@ -120,6 +156,8 @@ export class JobStore {
     format: VideoFormat,
     language: string,
     ttsChoice?: JobTtsChoice,
+    preset?: PlatformPresetId,
+    shortClipStrategy?: ShortClipStrategy,
   ): Job {
     const id = `job-${randomUUID()}`;
     const now = nowIso();
@@ -129,12 +167,16 @@ export class JobStore {
       input,
       format,
       language,
+      preset: preset ?? 'youtube-shorts',
       progress: 0,
       createdAt: now,
       updatedAt: now,
     };
     if (ttsChoice && (ttsChoice.engine || ttsChoice.voice)) {
       job.ttsChoice = { ...ttsChoice };
+    }
+    if (shortClipStrategy) {
+      job.shortClipStrategy = shortClipStrategy;
     }
     this.jobs.set(id, job);
     return snapshot(job);
