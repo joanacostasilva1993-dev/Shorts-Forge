@@ -1,0 +1,66 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+.next/
+.nuxt/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env/
+.python-version
+
+# Model weights & caches (downloaded locally by the doctor script)
+models/
+*.pt
+*.onnx
+*.bin
+*.safetensors
+
+# Pipeline outputs (generated media, specs, renders)
+outputs/
+runs/
+*.mp4
+*.mp3
+*.wav
+!docs/**/*.mp4
+!packages/transcription/tests/fixtures/*.wav
+# Voice samples for Joana's approval are deliberate deliverables.
+!packages/tts/samples/**/*.mp3
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+.coverage/
+.hypothesis/

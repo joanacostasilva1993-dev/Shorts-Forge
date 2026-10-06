@@ -1,0 +1,34 @@
+{
+  "description": "AI-powered video generation pipeline: audio/topic → vertical shorts (9:16) or long videos (16:9), two-phase LLM → TTS → render architecture. Free/local-first.",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "video",
+    "tts",
+    "llm",
+    "shorts",
+    "hyperframes",
+    "ffmpeg"
+  ],
+  "license": "AGPL-3.0-only",
+  "name": "shorts-forge",
+  "private": true,
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present",
+    "dev": "npm run dev --workspaces --if-present",
+    "doctor": "node scripts/doctor.mjs",
+    "lint": "npm run lint --workspaces --if-present",
+    "models:download": "node scripts/models-download.mjs",
+    "models:download": "node scripts/models-download.mjs",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:pipeline": "npm run dev --workspace=@shorts-forge/pipeline"
+  },
+  "type": "module",
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/*"
+  ]
+}
