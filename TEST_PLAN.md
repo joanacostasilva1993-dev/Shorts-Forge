@@ -1,9 +1,10 @@
 # Plano de Testes — shorts-forge (QA)
 
-> Âmbito: **Fase 1** (fundações). Cobertura dos contratos documentados em
-> `ARCHITECTURE.md`; os pacotes `pipeline`, `video` e `ui` estão em
-> construção em paralelo, por isso as estratégias abaixo visam as
-> **interfaces documentadas**, não o código ainda inacabado.
+> Âmbito: **Fases 1–3** (fundações, voz e guião, imagem + B-roll + i18n).
+> Cobertura dos contratos documentados em `ARCHITECTURE.md`; os pacotes
+> `pipeline`, `video` e `ui` evoluíram em paralelo, por isso as estratégias
+> visam as **interfaces documentadas e o código real** — o que ainda não
+> corre é testado com skip explícito, nunca com "sucesso" fingido.
 > Convenções: docs em pt-PT, identificadores de código em inglês.
 
 ## 1. Estratégia geral
@@ -344,3 +345,198 @@ Checklist manual (quando TTS + LLM estiverem ligados):
 - [ ] `GET …/download` antes da Fase 4 → 409 honesto (sem MP4 inventado)
 - [ ] repetir com entrada de áudio real: transcrição com word timestamps;
       `actualDurationSec` da transcrição
+
+---
+
+# Fase 3 — Imagem + B-roll + i18n (adenda QA, 2026-10-06)
+
+> Estado verificado contra a realidade: a engenharia (b) entregou o
+> resolvedor de B-roll (`packages/video/src/broll.ts`, 23 testes); a
+> engenharia (c) entregou o catálogo de vozes (`packages/tts/voices.catalog.json`
+> + `pipeline/src/voiceCatalog.ts` + `ui/src/lib/voices.ts` + seletor na UI),
+> os orçamentos de legendas (`video/src/captions.ts`) e a opção de idioma no
+> adaptador Hyperframes. A engenharia (a) ainda não ligou o preview real nem
+> o `assemble()` (continuam stubs honestos: 501 / throw). **Regressão
+> aberta**: `npm run typecheck` do `pipeline` falha em `src/orchestrate.ts:307`
+> e `src/server.ts:219` (`exactOptionalPropertyTypes` vs a assinatura de
+> `resolveTtsForJob`) — fix de uma linha no dono (ver relatório de QA).
+
+## 13. Pipeline de render — estratégia (Fase 3a)
+
+Ficheiros: `packages/pipeline/test/phase3-endpoints.contract.test.ts`
+(12 testes, verdes).
+
+### 13.1 Endpoints preview/download — matriz de contrato
+
+| Caso | Esperado (verificado) |
+|---|---|
+| `GET …/download`, job `done` + MP4 real em disco | 200 `video/mp4`, bytes idênticos ao ficheiro, `Content-Disposition: attachment` |
+| `GET …/download`, job em `rendering` | 409 `job_not_finished` (a mensagem diz o estado atual, pt-PT) |
+| `GET …/download`, job `done` mas sem ficheiro | 409 `video_not_ready` (montagem Fase 4 ainda por implementar) |
+| `GET …/download`, job desconhecido | 404 `job_not_found` |
+| `POST …/download` | 405 `method_not_allowed` |
+| `GET …/preview` (qualquer job) | **501 `not_implemented`** — stub honesto; este caso é o contrato ATUAL |
+
+Regra de transição: quando a engenharia (a) ligar o preview real, o caso
+501 é **substituído** (não apagado em silêncio) por: job com preview
+gerado → 200 com o MP4 de baixa resolução; 404/409 honestos antes disso.
+O happy path do download já testa bytes reais — nunca conteúdo inventado.
+
+### 13.2 Aceitação dos quatro idiomas em `POST /api/jobs`
+
+`POST /api/jobs` com `language` em `pt-PT | pt-BR | en | fr` → 201 e
+`job.language` guarda a tag exata; omissão continua `pt-PT`. (Testes no
+mesmo ficheiro de contrato.)
+
+### 13.3 Por fazer (engenharia (a), Fase 3→4)
+
+- `renderFrames()` por segmento após `buildFrames()` (o adaptador existe
+  e está verificado; falta a chamada no fluxo do job).
+- `assemble()` real (hoje lança `STUB` honestamente — teste
+  `assemble is an unmistakable stub` no `ffmpeg.test.ts` fixa-o).
+- `GET …/preview` real (baixa resolução) ligado ao passo de preview da UI.
+
+## 14. B-roll — estratégia (Fase 3b) ✅ entregue
+
+Implementação: `packages/video/src/broll.ts`. Testes do dono:
+`packages/video/src/test/broll.test.ts` — **23 testes** (revistos pelo QA;
+cobrem o contrato todo). A camada HTTP é mockada via `fetchImpl`
+injetável — **zero chamadas à rede real** na suite.
+
+### 14.1 Contrato verificado (cascata ARCHITECTURE.md §7)
+
+| Caso | Esperado (verificado) |
+|---|---|
+| chave Pexels + API saudável | `provider: 'pexels'`, `clipId: 'pexels-<id>'`, `Authorization` com a chave, `orientation=portrait` para 9:16; clip sacado para `outputs/cache/broll/<clipId>.mp4`; `clipId` marcado no registo |
+| Pexels 500/erro + chave Pixabay | cai para `provider: 'pixabay'` (fall-through silencioso mas registado no `log`) |
+| sem chaves | **zero HTTP**; `provider: 'image'` — MP4 Ken Burns gerado de verdade pelo FFmpeg local |
+| sem chaves e sem FFmpeg | `provider: 'template'`, `url: ''` — o `buildFrames()` usa a cor do template; **nunca vazio** |
+| tudo falha | `resolveBroll` **nunca lança** — devolve sempre uma entrada válida (never-empty guarantee) |
+| 2 segmentos, 1 clip | o 2.º não reutiliza o `clipId` (registo no-repeat por projeto, persistido em `broll-registry.json`) |
+| 2.ª resolução do mesmo clip | **sem re-download** (cache hit por `clipId`) |
+| `downloadToCache` com HTTP 403 | `false`, sem lançar |
+
+### 14.2 Unidades puras verificadas
+
+- `scoreCandidate`: duração exata → `durationFit` 1.0; 2× → 0.7 (corta-se,
+  barato); metade → 0.375 (loop é pior que corte); portrait ganha em 9:16.
+- `selectBestCandidate`: escolhe o melhor score; salta ids usados; `null`
+  quando todos usados (a cascata continua).
+- `buildSearchQuery`: keywords primeiro (máx 3); sem keywords → tokens da
+  descrição; nunca vazio (`'abstract background'`).
+- `UsedClipRegistry`: `mark`/`has` + persistência entre loads; ficheiro
+  corrupto/ausente → começa vazio, sem crash.
+- Builders de args FFmpeg (`buildGradientStillArgs`, `buildKenBurnsArgs`,
+  `buildTemplateClipArgs`): determinísticos; zoompan cobre a duração toda.
+- `kenBurnsVariant`: determinístico por `segment.id` (mesmo segmento →
+  mesma variante).
+
+### 14.3 Testes ao vivo (honestos, com skip)
+
+`LIVE: Pexels/Pixabay search returns real candidates` — correm **só** com
+`PEXELS_API_KEY`/`PIXABAY_API_KEY` no ambiente; sem chaves, saltam com
+motivo explícito (nunca simulados). Fazer no PC da Joana quando houver
+chaves gratuitas.
+
+## 15. i18n — estratégia (Fase 3c) ✅ entregue (com 1 regressão aberta)
+
+Fonte única de verdade: `packages/tts/voices.catalog.json` (lido pelo
+pipeline TS, pelo serviço Python `voices_catalog.py` e pela UI).
+
+### 15.1 Catálogo de vozes — contrato verificado
+
+Ficheiro: `packages/pipeline/test/i18n-voices.contract.test.ts`
+(17 testes, verdes contra a implementação real, na suite normal).
+
+| Idioma | Default (verificado) | Porquê |
+|---|---|---|
+| pt-PT | edge-tts / `pt-PT-DuarteNeural` | o Kokoro **não tem** voz pt-PT — usar Kokoro aqui seria sotaque brasileiro silencioso (teste anti-regressão dedicado) |
+| pt-BR | kokoro / `pf_dora` | a voz que a Joana adorou; local e grátis |
+| en | kokoro / `af_heart` | voz inglesa do Kokoro mais bem avaliada |
+| fr | kokoro / `ff_siwis` | **única** voz francesa do Kokoro-82M (confirmada em runtime: `models/kokoro/voices/ff_siwis.pt`); a Joana decide de ouvido |
+
+Contrato verificado:
+- `supportedLanguages()` → `[pt-PT, pt-BR, en, fr]` (ordem do catálogo = ordem da UI).
+- `resolveTtsForJob({ language })` sem env/UI → default do idioma; com
+  env (`TTS_ENGINE`/`KOKORO_VOICE`/…) → env vence; com escolha da UI
+  (`engine`/`voice`) → UI vence tudo.
+- A `chain` devolvida é a `fallbackChain` do catálogo; **a 1.ª entrada é
+  sempre no idioma do job** (nunca muda de idioma em silêncio no 1.º salto;
+  o `pf_dora` na cadeia pt-PT está documentado como "sotaque brasileiro,
+  fallback quando não há rede" — explícito, não silencioso).
+- Idioma desconhecido → `ApiError` 400 `unsupported_language` (pt-PT, lista
+  os suportados); `TTS_ENGINE`/`SPEECH_RATE` inválidos → 500
+  `invalid_tts_config`.
+- `whisperLanguageCode('pt-PT')` → `'pt'` (hint do faster-whisper).
+- Integridade: versão 1, 4 idiomas, vozes todas nomeadas, `verified` é
+  booleano; **há vozes `verified: false`** (ver checklist manual abaixo).
+
+### 15.2 Orçamentos de legendas — contrato verificado
+
+Ficheiro: `packages/video/src/test/captions-i18n.contract.test.ts`
+(8 testes, verdes). Funções puras em `video/src/captions.ts`.
+
+| Base | `maxCharsPerLine` | `maxLines` | `fontScale` |
+|---|---|---|---|
+| pt (pt-PT, pt-BR) | 28 | 2 | 0.94 |
+| fr | 30 | 2 | 0.96 |
+| en (e omissão) | 34 | 2 | 1.0 |
+
+- `getCaptionBudget`: `'PT-pt'`/`' fr '` → normaliza; desconhecido (`de`,
+  `''`) → omissão inglês, sem crash; ordem documentada pt < fr < en.
+- `wrapCaptionLines`: greedy, nunca excede o máximo, palavra maior que o
+  máximo fica sozinha (nunca parte a meio), determinístico, sem perdas.
+- `captionFontSizePx`: escala o `fontSizePx` do template pelo `fontScale`.
+- ✅ Resolvido pela engenharia (c): `getCaptionBudget`/`wrapCaptionLines`/
+  `captionFontSizePx` (e o tipo `CaptionBudget`) estão re-exportados no
+  `packages/video/src/index.ts` (API pública).
+
+### 15.3 UI — seletor de idioma e vozes (verificação manual)
+
+Implementado: `ui/src/lib/voices.ts` + `StepInput` (seletor) + `StepVoice`
+(voice picker por idioma/motor). Checklist manual:
+
+- [ ] o seletor mostra os 4 idiomas pela ordem do catálogo, com labels pt-PT
+- [ ] mudar de idioma repõe a voz omissa desse idioma (sem voz "pendurada" do idioma anterior)
+- [ ] mudar de motor escolhe a 1.ª voz desse motor no idioma; se o motor não tem voz no idioma, volta à omissão do idioma
+- [ ] `POST /api/jobs` recebe `{ tts: { engine, voice } }` da UI e o job resolve a voz certa (contrato servidor já coberto em `server.ts`)
+
+### 15.4 Checklist manual — verificação de vozes no PC da Joana 🎧
+
+As vozes `verified: false` vêm da documentação pública dos providers —
+**têm de ser confirmadas em runtime** (a sandbox bloqueia o WebSocket do
+Edge-TTS, por isso não deu para validar aqui). Ferramenta pronta:
+`packages/tts/service/verify_voices.py`.
+
+- [ ] correr `verify_voices.py` no PC da Joana e confirmar cada nome:
+      `fr-FR-DeniseNeural`, `fr-FR-HenriNeural` (candidatas a omissão fr se
+      a `ff_siwis` não convencer), `pt-BR-FranciscaNeural`,
+      `pt-BR-AntonioNeural`, `en-US-AriaNeural`, `en-US-GuyNeural`,
+      `pt-PT-Neural2-A`, `pt-BR-Neural2-A`, `en-US-Neural2-A`,
+      `fr-FR-Neural2-A` (estas últimas só com credenciais Google)
+- [ ] gerar amostras Edge-TTS em **francês** (2–3 frases com entoação
+      variada: pergunta, exclamação, frase longa) e a Joana ouve e
+      classifica: naturalidade 1–5, artefactos
+- [ ] comparar `ff_siwis` (Kokoro, omissão fr atual) vs
+      `fr-FR-DeniseNeural` — a Joana decide de ouvido qual fica como
+      omissão; atualizar `defaultVoice`/`defaultProvider` de `fr` no
+      `voices.catalog.json` em conformidade
+- [ ] repetir para `pt-BR-FranciscaNeural` vs `pf_dora` (pt-BR já tem
+      omissão Kokoro; confirmar que a Edge-TTS é fallback são)
+- [ ] marcar `verified: true` no catálogo para cada nome confirmado e
+      registar a decisão no `docs/i18n.md` §3–§4 (criado pela engenharia
+      (c); o `$comment` do catálogo referencia-o)
+- [ ] confirmar que os `<mark/>` SSML não alteram a prosódia das vozes fr
+      (ouvir as amostras do teste de marks)
+
+### 15.5 Regressão (resolvida no próprio dia)
+
+Durante a escrita destes testes, o `npm run typecheck` do `packages/pipeline`
+falhou (`src/orchestrate.ts:307`, `src/server.ts:219` — a assinatura de
+`resolveTtsForJob` declarava `engine?: string` mas os call sites passam
+`string | undefined` com `exactOptionalPropertyTypes`). Reportada ao dono
+(engenharia (c)), que aplicou o fix sugerido (`engine?: string | undefined`)
+e ainda adicionou os próprios testes em `test/voiceCatalog.test.ts`.
+Lição de QA: regressões de typecheck em código partilhado quebram o
+`npm test` do pacote inteiro (o `build` falha antes do `node --test`) —
+o `typecheck` faz parte do "verde".

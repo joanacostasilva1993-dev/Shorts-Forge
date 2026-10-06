@@ -2,12 +2,13 @@
  * Renderer-agnostic frame descriptors.
  *
  * buildFrames turns a (re-timed) Spec into one FrameDescriptor per
- * segment. It is pure: no I/O, no rendering, no timing invention —
- * durations come from actualDurationSec (measured in Phase B) falling
- * back to targetDurationSec, and caption timing comes from the real
- * TTS word timestamps.
+ * segment. buildFrameDescriptor is the per-segment primitive behind it:
+ * pure, no I/O, no rendering, no timing invention — durations come from
+ * actualDurationSec (measured in Phase B) falling back to
+ * targetDurationSec, and caption timing comes from the real TTS word
+ * timestamps.
  */
-import type { Spec } from '@shorts-forge/shared';
+import type { Segment, Spec } from '@shorts-forge/shared';
 import { buildCues, renderCaptionHtml, type CaptionCue } from './captions.js';
 import { getTemplate, type BrandTemplate } from './templates.js';
 
@@ -34,6 +35,11 @@ export interface FrameDescriptor {
    * real word timestamps.
    */
   captionHtmlAt: (t: number) => string;
+  /**
+   * Optional on-screen hook text (from `Segment.hookLine`). Renderers may
+   * overlay it at the start of the shot, styled with the template accent.
+   */
+  hookLine?: string;
 }
 
 export interface BuiltFrames {
@@ -44,6 +50,33 @@ export interface BuiltFrames {
 }
 
 /**
+ * Builds the FrameDescriptor for ONE segment (the per-segment primitive).
+ * Pure: durations from actualDurationSec ?? targetDurationSec, captions
+ * from the segment's real TTS word timestamps, hook line carried over.
+ * @throws when the template id is unknown (via getTemplate).
+ */
+export function buildFrameDescriptor(
+  segment: Segment,
+  template: BrandTemplate,
+): FrameDescriptor {
+  const durationSec = segment.actualDurationSec ?? segment.targetDurationSec;
+  const cues: CaptionCue[] = buildCues(segment.tts?.words ?? []);
+  const background: FrameBackground =
+    segment.broll?.url != null && segment.broll.url !== ''
+      ? { kind: 'broll', url: segment.broll.url }
+      : { kind: 'color', color: template.colors.bg };
+  const hookLine = segment.hookLine?.trim() ? segment.hookLine.trim() : undefined;
+  const frame: FrameDescriptor = {
+    segmentId: segment.id,
+    durationSec,
+    background,
+    captionHtmlAt: (t: number) => renderCaptionHtml(cues, t, template),
+  };
+  if (hookLine !== undefined) frame.hookLine = hookLine;
+  return frame;
+}
+
+/**
  * Builds one FrameDescriptor per segment of the spec.
  * @throws when the template id is unknown (via getTemplate).
  */
@@ -51,19 +84,8 @@ export function buildFrames(spec: Spec, templateId: string): BuiltFrames {
   const template = getTemplate(templateId);
   let offset = 0;
   const frames: FrameDescriptor[] = spec.segments.map((segment) => {
-    const durationSec = segment.actualDurationSec ?? segment.targetDurationSec;
-    const cues: CaptionCue[] = buildCues(segment.tts?.words ?? []);
-    const background: FrameBackground =
-      segment.broll?.url != null && segment.broll.url !== ''
-        ? { kind: 'broll', url: segment.broll.url }
-        : { kind: 'color', color: template.colors.bg };
-    const frame: FrameDescriptor = {
-      segmentId: segment.id,
-      durationSec,
-      background,
-      captionHtmlAt: (t: number) => renderCaptionHtml(cues, t, template),
-    };
-    offset += durationSec;
+    const frame = buildFrameDescriptor(segment, template);
+    offset += frame.durationSec;
     return frame;
   });
   return { frames, template, totalDurationSec: offset };

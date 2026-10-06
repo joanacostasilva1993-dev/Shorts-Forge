@@ -6,9 +6,10 @@
  * estrito; a validação abaixo garante o contrato `Spec` do shared antes de
  * a Spec chegar à UI para revisão.
  *
- * Decisão de prompt (documentada): a narração é pedida em português
- * EUROPEU (pt-PT) mas as `visualKeywords` são pedidas em INGLÊS — as APIs
- * de stock footage (Pexels, Pixabay) indexam muito melhor em inglês.
+ * Decisão de prompt (documentada): a narração é pedida NO IDIOMA DO JOB
+ * (ver `buildSpecSystemPrompt`) mas as `visualKeywords` são pedidas em
+ * INGLÊS — as APIs de stock footage (Pexels, Pixabay) indexam muito melhor
+ * em inglês, seja qual for o idioma da narração.
  */
 
 import type {
@@ -46,10 +47,52 @@ const DEFAULT_LANGUAGE = 'pt-PT';
 const DEFAULT_MAX_SEGMENTS = 12;
 
 /**
- * System prompt (English prompt-engineering; the *output* rules force
- * pt-PT narration and ENGLISH visualKeywords).
+ * Per-language narration rules injected into the system prompt (rule 1),
+ * plus the spoken-word budget per segment (rule 5). English prompt
+ * engineering throughout; the *output* language is what varies.
+ *
+ * Languages not listed here get a generic rule naming the tag — the LLM
+ * still writes in the requested language, just without the
+ * dialect-specific guardrails.
  */
-export const SPEC_SYSTEM_PROMPT = `You are an expert scriptwriter for short-form video content (vertical 9:16 shorts and horizontal 16:9 videos).
+const PROMPT_LANGUAGE_RULES: Record<string, { rule: string; wordsPerSegment: string }> = {
+  'pt-PT': {
+    rule: 'narration MUST be written in EUROPEAN Portuguese (pt-PT), never Brazilian Portuguese. Use "telemóvel" not "celular", "ecrã" not "tela", "fixe" not "legal", second-person "tu" verb forms ("tu consegues", "o teu"), and the European gerund construction ("estou a fazer", NEVER "estou fazendo"). The narration is what the viewer hears, so it must sound natural when spoken aloud in Portugal.',
+    wordsPerSegment: '8-22 spoken words each in pt-PT',
+  },
+  'pt-BR': {
+    rule: 'narration MUST be written in BRAZILIAN Portuguese (pt-BR), never European Portuguese. Use "celular" not "telemóvel", "tela" not "ecrã", "legal" not "fixe", "você" forms ("você consegue", "o seu"), and the Brazilian gerund construction ("estou fazendo", NEVER "estou a fazer"). The narration is what the viewer hears, so it must sound natural when spoken aloud in Brazil.',
+    wordsPerSegment: '8-22 spoken words each in pt-BR',
+  },
+  en: {
+    rule: 'narration MUST be written in natural spoken American English. Prefer contractions ("you\'ll", "it\'s"), short punchy sentences, and conversational phrasing a native speaker would actually say out loud — never stiff written-style prose.',
+    wordsPerSegment: '10-26 spoken words each in English',
+  },
+  fr: {
+    rule: 'narration MUST be written in natural spoken French (France). Use "tu" forms ("tu peux", "ton"), short sentences that read well aloud, and everyday vocabulary — never literal translations from English or stiff written-style prose.',
+    wordsPerSegment: '8-20 spoken words each in French',
+  },
+};
+
+function languageRule(language: string): { rule: string; wordsPerSegment: string } {
+  const known = PROMPT_LANGUAGE_RULES[language];
+  if (known) return known;
+  return {
+    rule: `narration MUST be written in the language tagged "${language}". Write naturally, as a native speaker would say it out loud — short sentences, conversational phrasing, never stiff written-style prose or literal translations from another language.`,
+    wordsPerSegment: '8-22 spoken words each',
+  };
+}
+
+/**
+ * Builds the system prompt for a narration language.
+ *
+ * English prompt-engineering; the *output* rules force narration in
+ * `language` and ENGLISH visualKeywords (stock APIs index better in
+ * English regardless of narration language).
+ */
+export function buildSpecSystemPrompt(language: string): string {
+  const lang = languageRule(language);
+  return `You are an expert scriptwriter for short-form video content (vertical 9:16 shorts and horizontal 16:9 videos).
 
 You ALWAYS reply with a single JSON object and nothing else — no markdown fences, no commentary. The JSON must match this exact shape:
 
@@ -69,14 +112,22 @@ You ALWAYS reply with a single JSON object and nothing else — no markdown fenc
 }
 
 Rules:
-1. narration MUST be written in EUROPEAN Portuguese (pt-PT), never Brazilian Portuguese. Use "telemóvel" not "celular", "ecrã" not "tela", "fixe" not "legal", second-person "tu" verb forms ("tu consegues", "o teu"), and the European gerund construction ("estou a fazer", NEVER "estou fazendo"). The narration is what the viewer hears, so it must sound natural when spoken aloud in Portugal.
+1. ${lang.rule}
 2. visualKeywords MUST be in ENGLISH (1 to 4 items). Stock footage APIs (Pexels, Pixabay) index far better in English. Pick concrete visual nouns/adjectives a camera could capture, e.g. ["sunrise", "city", "timelapse"] — not abstract concepts.
-3. brollDescription describes the B-roll shot in plain language (pt-PT is fine here).
+3. brollDescription describes the B-roll shot in plain language (${language} is fine here).
 4. Segment ids MUST be unique and ordered: "seg-01", "seg-02", ...
-5. targetDurationSec is a positive number (seconds) estimating how long the narration takes to speak. Keep segments between 3 and 8 seconds (roughly 8-22 spoken words each in pt-PT).
-6. The FIRST segment is the HOOK: open with a bold claim, a surprising fact or a direct question. Give it hookScore >= 0.8 and a hookLine of at most 6 words (pt-PT) for on-screen text.
+5. targetDurationSec is a positive number (seconds) estimating how long the narration takes to speak. Keep segments between 3 and 8 seconds (roughly ${lang.wordsPerSegment}).
+6. The FIRST segment is the HOOK: open with a bold claim, a surprising fact or a direct question. Give it hookScore >= 0.8 and a hookLine of at most 6 words (in ${language}) for on-screen text.
 7. hookScore is a number from 0 to 1; hookLine is optional on non-hook segments.
 8. Respect any topic, transcript, format, duration target and segment limits given in the user message.`;
+}
+
+/**
+ * System prompt (English prompt-engineering; the *output* rules force
+ * pt-PT narration and ENGLISH visualKeywords). Kept as the pt-PT
+ * specialization of buildSpecSystemPrompt for backwards compatibility.
+ */
+export const SPEC_SYSTEM_PROMPT = buildSpecSystemPrompt('pt-PT');
 
 function buildUserPrompt(input: PipelineInput, opts: Required<Pick<GenerateSpecOptions, 'format' | 'language'>> & GenerateSpecOptions): string {
   const maxSegments = opts.maxSegments ?? DEFAULT_MAX_SEGMENTS;
@@ -264,7 +315,7 @@ export async function generateSpec(
 
   const request: ChatRequest = {
     messages: [
-      { role: 'system', content: SPEC_SYSTEM_PROMPT },
+      { role: 'system', content: buildSpecSystemPrompt(language) },
       { role: 'user', content: buildUserPrompt(input, { ...opts, format, language }) },
     ],
     jsonMode: true,

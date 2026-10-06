@@ -14,6 +14,7 @@ export const SAMPLE_DATA_LABEL = 'dados de exemplo (simulação)';
 export function generateMockSpec(
   topic: string,
   format: VideoFormat,
+  language = 'pt-PT',
 ): Spec {
   const title = topic.trim() || 'Vídeo de exemplo';
   const segments: Segment[] = [
@@ -44,7 +45,7 @@ export function generateMockSpec(
     version: 1,
     title,
     format,
-    language: 'pt-PT',
+    language,
     segments,
   };
 }

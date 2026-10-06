@@ -76,36 +76,81 @@ contra planos):
 durações reais; transcrição de áudio de 60 s com word timestamps corretos;
 3 providers TTS comutáveis.
 
-## Fase 3 — Imagem (Hyperframes + legendas + preview)
+## Fase 3 — Imagem + B-roll + i18n 🔶 em curso (QA: 2026-10-06)
 
-**Objetivo:** ver o vídeo antes do render final.
+**Objetivo:** ver o vídeo antes do render final; B-roll real com
+fallbacks; narração em 4 idiomas.
 
-- `video`: `buildFrames()` após re-temporização → `renderFrames()` por
-  segmento (adaptador já verificado); `lintCompositionHtml` como gate
-- `preview()`: HTML autónomo já existe → ligar ao passo de preview da UI
-- B-roll em vídeo (URLs mp4/webm como `<video>`) — validar além do
-  fallback de imagem/cor
-- `pipeline`: SSE de progresso dos jobs
+**Estado verificado contra a realidade** (não contra planos):
 
-**Done:** preview de 3 segmentos com legendas karaoke sincronizadas,
-gerado só com dados medidos; `hyperframes lint` sem erros.
+- [x] `video`: `buildFrames()` após re-temporização (puro, testado) →
+  `renderFrames()` por segmento (adaptador já verificado na Fase 1);
+  `lintCompositionHtml` como gate
+- [x] B-roll: cascata real `Pexels → Pixabay → Ken Burns local →
+  fundo gerado` (`packages/video/src/broll.ts`) — **23/23 testes verdes**
+  com HTTP mockado (ordem da cascata, never-empty, cache por `clipId`,
+  registo no-repeat por projeto em `broll-registry.json`,
+  `orientation=portrait` para 9:16); testes LIVE honestos saltam sem chaves
+- [x] i18n: `packages/tts/voices.catalog.json` (fonte única de verdade) +
+  `pipeline/src/voiceCatalog.ts` + `ui/src/lib/voices.ts` + **seletor de
+  idioma na UI** (`StepInput`) e voice picker (`StepVoice`); 4 idiomas:
+  pt-PT (edge-tts `pt-PT-DuarteNeural`), pt-BR (kokoro `pf_dora`),
+  en (kokoro `af_heart`), fr (kokoro `ff_siwis`) — 17 testes de contrato
+  verdes; orçamentos de legendas por idioma (`getCaptionBudget`,
+  `wrapCaptionLines` — 8 testes verdes)
+- [x] `pipeline`: `GET /api/jobs/:id/download` serve o MP4 real (200 com
+  bytes + `Content-Disposition`; 404/409 honestos); `POST /api/jobs`
+  aceita os 4 idiomas e o `{ tts: { engine, voice } }` da UI
+- [x] `preview()`: `GET /api/jobs/:id/preview` **real** (render leve Hyperframes 360x640 com cache por hash da Spec; 409 `preview_not_ready` sem Spec, 404 job desconhecido) — verificado ao vivo: 200 `video/mp4` em ~14 s, 2ª chamada em 0,005 s (cache). O contrato de teste 501 foi substituído pelo comportamento real, como a nota do próprio teste previa.
+- [x] `video.assemble()`: **real** (`assembleJob()` — FFmpeg com `buildAssembleArgs()`, normalização de áudio 48 kHz estéreo amostra-a-amostra, `detectHwAccel()` honestificado com probe de encode real); e2e honesto: 2 segmentos → `final.mp4` verificado com ffprobe (h264 1080x1920 + aac).
+- [x] B-roll ligado na orquestração: `resolveBrollForSegments()` corre na Fase B após `retimeSpec()` (cache em `outputs/cache/broll`, registo no-repeat em `outputs/<jobId>/broll-registry.json`).
+- [x] Testes pytest da transcrição ligados ao `npm test` (skip gracioso sem venv).
+- [x] **Regressão de typecheck resolvida no próprio dia**: `npm run
+  typecheck` do `pipeline` falhou temporariamente (`src/orchestrate.ts:307`,
+  `src/server.ts:219` — `exactOptionalPropertyTypes` vs assinatura de
+  `resolveTtsForJob`); reportada ao dono (engenharia (c)), que aplicou o
+  fix de uma linha no `voiceCatalog.ts` e adicionou os próprios testes
+  (`test/voiceCatalog.test.ts`). `npm run typecheck` verde em todos os
+  workspaces.
+- [ ] Validação ao vivo: pesquisas Pexels/Pixabay reais (testes LIVE
+  saltam sem chaves); nomes de vozes `verified: false` por confirmar no
+  PC da Joana (fr-FR-DeniseNeural/HenriNeural, pt-BR-FranciscaNeural,
+  en-US-AriaNeural, …) + amostras de escuta em francês (ver
+  `TEST_PLAN.md` §15.4)
 
-## Fase 4 — Montagem + QC (B-roll + FFmpeg + quality-review)
+**Done (quando fechar):** preview real de baixa resolução por segmento;
+typecheck verde; validação ao vivo das chaves B-roll e das vozes por
+confirmar.
+
+> Nota de âmbito: o bullet "Multi-idioma de narração além de pt-PT" saiu
+> de "Fora de âmbito" — a Fase 3 entrega pt-PT, pt-BR, inglês e francês
+> (decisão da Joana, 2026-10-06; o ROADMAP antigo ficou para trás).
+
+## Fase 4 — Montagem + QC (assemble real + quality-review)
 
 **Objetivo:** MP4 final com B-roll real, verificado automaticamente.
 
-- Resolução de B-roll por segmento: matching semântico com as keywords
-  do LLM (Pexels → Pixabay → imagem local com Ken Burns); registo
-  no-repeat por projeto; `orientation=portrait` para 9:16
-- `video.assemble()`: spawn do FFmpeg com `buildAssembleArgs()` (já
-  testado); cache de B-roll em `outputs/cache/broll/`
+**O que a Fase 3 já entregou** (não repetir): resolução de B-roll por
+segmento com cascata Pexels → Pixabay → Ken Burns → template, cache por
+`clipId` em `outputs/cache/broll/`, registo no-repeat por projeto,
+`orientation=portrait` para 9:16 e scoring por relevância/duração/
+orientação. O que falta aqui é **afinação**, não construção.
+
+- **Afinação semântica do B-roll**: melhorar o scoring com os dados reais
+  das pesquisas (a heurística atual usa overlap de keywords/tags; validar
+  com pesquisas reais e ajustar pesos); `buildAssembleArgs()` já testado
+- `video.assemble()` **real**: `renderFrames()` por segmento →
+  concatenação com as faixas de narração TTS (spawn do FFmpeg com
+  `buildAssembleArgs()`); o stub atual lança honestamente
+- `GET /api/jobs/:id/preview` real (baixa resolução) ligado à UI
 - **QC automático pós-render** (ideia adotada do OpenMontage): etapa `qc`
   entre render e `done` — duração vs soma de `actualDurationSec`, streams,
   resolução, frames pretos (`blackdetect`), silêncio (`silencedetect`),
   clipping (`astats`), legendas presentes, integridade (`ffprobe`);
   estado `qc-failed` bloqueia o download até correção/aprovação manual
 - **Presets por plataforma** (TikTok/YouTube/Instagram) no `RenderOptions`
-- `pipeline`: `POST /api/jobs/:id/render` + `GET /api/jobs/:id/download`
+- Validação ao vivo das pesquisas Pexels/Pixabay com chaves gratuitas
+  (os testes LIVE da Fase 3 saltam sem chaves)
 
 **Done:** MP4 9:16 de 30–60 s com B-roll, legendas e áudio, gerado
 end-to-end sem intervenção após aprovação da Spec, com relatório QC
@@ -155,8 +200,6 @@ minutos de interação.
 - Publicação automática (TikTok/YouTube/Instagram) — só download do MP4
 - Vozes pagas (ElevenLabs) como requisito — proibido pela política
   free-only
-- Multi-idioma de narração além de pt-PT — estrutura pronta (`language`),
-  vozes depois
 - Edição avançada na UI (corte fino, keyframes) — só o essencial
 - Copiar código de outros projetos — ideias e conceitos sim, código não
   (licença AGPL-3.0; reutilização MIT/Apache só com origem documentada

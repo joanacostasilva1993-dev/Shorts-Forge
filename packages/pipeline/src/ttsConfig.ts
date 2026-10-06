@@ -1,5 +1,5 @@
 /**
- * Resolves the TTS voice configuration from the environment for Phase B.
+ * Resolves the TTS voice configuration from the environment.
  *
  * Source of truth: `.env.example` (TTS_ENGINE, KOKORO_VOICE, EDGE_TTS_VOICE,
  * GOOGLE_TTS_VOICE, SPEECH_RATE). Mapping from the UI `TtsEngine`:
@@ -8,6 +8,11 @@
  * An empty `voice` means "use the TTS service's own default voice" — the
  * Python service (Fase 2) owns its catalog of voices; the pipeline only
  * overrides when the user configured one explicitly.
+ *
+ * NOTE (Fase 3 — i18n): Phase B no longer calls this directly. It uses
+ * `resolveTtsForJob()` (voiceCatalog.ts), which layers the job language's
+ * catalog default under these env overrides: explicit UI choice > env >
+ * catalog default. This function remains as the env-only building block.
  */
 
 import { ApiError } from './jobs.js';

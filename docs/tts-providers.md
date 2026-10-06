@@ -1,7 +1,11 @@
 # Providers de TTS — shorts-forge
 
-> Estado: contrato do cliente TypeScript finalizado (`packages/pipeline/src/pythonBridge.ts`).
-> Os SERVIDORES Python (Kokoro, Edge-TTS, Google) chegam na **Fase 2**.
+> Estado: Fase 3. Contrato do cliente TypeScript finalizado
+> (`packages/pipeline/src/pythonBridge.ts`); servidores Python dos três
+> providers implementados na Fase 2. **Catálogo de vozes por idioma**
+> (fonte única de verdade): `packages/tts/voices.catalog.json` —
+> ver [docs/i18n.md](./i18n.md) para omissões, cadeias de fallback e a
+> decisão da voz francesa.
 > Identificadores de código em inglês; este documento em pt-PT.
 
 ## 1. Visão geral
@@ -10,9 +14,9 @@ O shorts-forge suporta três providers de texto-para-fala, selecionáveis na UI:
 
 | Provider | Omissão? | Custo | Chave | Vozes pt-PT | Word timestamps |
 |---|---|---|---|---|---|
-| **Kokoro** | ✅ omissão | local, grátis | nenhuma | sim (a confirmar na Fase 2) | nativos (a confirmar na Fase 2) |
-| **Edge-TTS** | fallback | grátis | nenhuma | sim | via SSML marks (a confirmar na Fase 2) |
-| **Google Cloud TTS** | opcional | tier grátis generoso, depois pago por carácter | `GOOGLE_TTS_API_KEY` **ou** `GOOGLE_APPLICATION_CREDENTIALS` | sim | via SSML `<mark>` + `enable_time_pointing` (ver §4) |
+| **Kokoro** | ✅ omissão | local, grátis | nenhuma | **não tem** (só pt-BR: `pf_dora`, `pm_alex`, `pm_santa` — confirmado em runtime na Fase 2) | via faster-whisper (confirmado na Fase 2) |
+| **Edge-TTS** | fallback | grátis | nenhuma | sim (`pt-PT-DuarteNeural`, `pt-PT-RaquelNeural` — confirmados via `list_voices()`) | nativos (`wordboundary`) |
+| **Google Cloud TTS** | opcional | tier grátis generoso, depois pago por carácter | `GOOGLE_TTS_API_KEY` **ou** `GOOGLE_APPLICATION_CREDENTIALS` | sim (nomes a confirmar com credenciais) | via SSML `<mark>` + `enable_time_pointing` (ver §4) |
 
 Regras que não mudam:
 
@@ -25,15 +29,30 @@ Regras que não mudam:
 ### Kokoro (omissão — local, grátis, sem chave)
 
 - Corre em Python no PC, sem rede e sem conta.
-- Vozes pt-PT a validar na Fase 2 (naturalidade do português europeu — risco já registado no ARCHITECTURE.md §11).
-- Devolve timestamps por palavra nativamente (a confirmar contra a versão do Kokoro usada na Fase 2; se não devolver, aplica-se o mesmo fallback faster-whisper do §4.3).
-- Variável: `KOKORO_VOICE` (nome da voz no catálogo Kokoro).
+- **Não tem vozes pt-PT** (confirmado em runtime na Fase 2: as únicas
+  portuguesas são `pf_dora`, `pm_alex`, `pm_santa` — todas pt-BR). Para
+  sotaque europeu genuíno, a omissão pt-PT é `edge-tts`
+  (`pt-PT-DuarteNeural`/`pt-PT-RaquelNeural`). Tem voz francesa
+  (`ff_siwis` — única) e inglesas (`af_heart` = omissão en, `af_bella`,
+  `am_adam`, …) — ver o catálogo e [docs/i18n.md](./i18n.md).
+- Word timestamps via re-temporização faster-whisper sobre o áudio gerado
+  (confirmado na Fase 2; o `KPipeline` não devolve timestamps nativos).
+- Variável: `KOKORO_VOICE` (nome da voz no catálogo Kokoro; omissão do
+  catálogo quando vazia).
 
 ### Edge-TTS (fallback grátis)
 
 - Serviço gratuito da Microsoft, sem chave, via rede.
-- Tem vozes pt-PT (exemplos — **verificar nomes exatos na Fase 2**: `pt-PT-DuarteNeural`, `pt-PT-RaquelNeural`).
-- Não garante word timestamps nativos; a Fase 2 pode usar SSML marks (mesma técnica do §4) ou faster-whisper.
+- Vozes pt-PT confirmadas via `list_voices()` em runtime:
+  `pt-PT-DuarteNeural`, `pt-PT-RaquelNeural` (ver
+  `packages/tts/samples/VOICES.md`).
+- **Fase 3 (i18n):** o provider resolve vozes por locale inferido do nome
+  da voz (`fr-FR-*` → lista `fr-FR`), em vez de filtrar só pt-PT. Vozes
+  `fr-FR-*`, `en-US-*` e `pt-BR-*` no catálogo estão **por verificar** no PC
+  da Joana (a sandbox bloqueia o WebSocket do Edge-TTS) — ver
+  [docs/i18n.md](./i18n.md) §4 e `packages/tts/service/verify_voices.py`.
+- Word timestamps nativos via eventos `wordboundary`; fallback
+  faster-whisper quando a voz não os emite.
 
 ### Google Cloud TTS (nova opção first-class)
 
@@ -129,7 +148,20 @@ Se os timepoints vierem incompletos ou ausentes (há registo histórico de marca
 
 ## 6. Resumo do que muda na Fase 2
 
-- [ ] Servidor Python: implementar os três providers atrás do contrato do §4 (ficheiro/serviço único com switch por `provider`, ou adaptadores — decisão de implementação da Fase 2).
-- [ ] Implementar o algoritmo de marks do §5.2 + fallback faster-whisper do §5.3 para o provider `google`.
-- [ ] Validar vozes pt-PT reais (Kokoro, Edge-TTS e Google) e fixar os nomes exatos — os nomes neste documento marcados como "exemplos" têm de ser confirmados.
+- [x] Servidor Python: implementar os três providers atrás do contrato do §4 (ficheiro/serviço único com switch por `provider`, ou adaptadores — decisão de implementação da Fase 2).
+- [x] Implementar o algoritmo de marks do §5.2 + fallback faster-whisper do §5.3 para o provider `google`.
+- [x] Validar vozes pt-PT reais (Kokoro, Edge-TTS e Google) e fixar os nomes exatos — **resultado: Kokoro não tem pt-PT** (só pt-BR); Edge-TTS `pt-PT-DuarteNeural`/`pt-PT-RaquelNeural` confirmados via `list_voices()`; Google por confirmar com credenciais.
 - [ ] Confirmar preços do tier grátis Google na página oficial antes de documentar números.
+
+## 7. Fase 3 (i18n) — vozes por idioma
+
+- Catálogo de vozes por idioma em `packages/tts/voices.catalog.json`
+  (fonte única de verdade para pipeline, serviço Python e UI).
+- Resolução de voz language-aware na Fase B: escolha explícita da UI >
+  env > omissão do catálogo para o idioma do job
+  (`packages/pipeline/src/voiceCatalog.ts::resolveTtsForJob`).
+- Omissões: pt-PT → `edge-tts/pt-PT-DuarteNeural`; pt-BR →
+  `kokoro/pf_dora`; en → `kokoro/af_heart`; fr → `kokoro/ff_siwis`
+  (única voz francesa do Kokoro-82M; `fr-FR-DeniseNeural` é a candidata
+  Edge-TTS por verificar).
+- Detalhes, racional e checklist de verificação manual: [docs/i18n.md](./i18n.md).

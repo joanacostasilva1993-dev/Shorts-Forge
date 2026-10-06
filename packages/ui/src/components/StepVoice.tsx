@@ -1,6 +1,13 @@
 import type { TtsEngine } from '../state';
+import {
+  voicesForLanguage,
+  defaultVoiceFor,
+  providerLabel,
+  type TtsProvider,
+} from '../lib/voices';
 
 interface Props {
+  language: string;
   ttsEngine: TtsEngine;
   setTtsEngine: (engine: TtsEngine) => void;
   voice: string;
@@ -9,56 +16,73 @@ interface Props {
   setRate: (rate: number) => void;
 }
 
-const VOICES: { value: string; label: string }[] = [
-  { value: 'kokoro-pt-1', label: 'Kokoro pt-PT — voz 1 (vozes reais na Fase 2)' },
-  { value: 'kokoro-pt-2', label: 'Kokoro pt-PT — voz 2 (vozes reais na Fase 2)' },
-  { value: 'edge-pt-1', label: 'Edge-TTS pt-PT — voz 1 (vozes reais na Fase 2)' },
-  { value: 'edge-pt-2', label: 'Edge-TTS pt-PT — voz 2 (vozes reais na Fase 2)' },
-  { value: 'google-pt-1', label: 'Google pt-PT — voz 1 (vozes reais na Fase 2)' },
-  { value: 'google-pt-2', label: 'Google pt-PT — voz 2 (vozes reais na Fase 2)' },
+const ENGINE_OF_PROVIDER: Record<TtsProvider, TtsEngine> = {
+  kokoro: 'kokoro',
+  'edge-tts': 'edge',
+  google: 'google',
+};
+
+const PROVIDER_OF_ENGINE: Record<TtsEngine, TtsProvider> = {
+  kokoro: 'kokoro',
+  edge: 'edge-tts',
+  google: 'google',
+};
+
+const ENGINES: { value: TtsEngine; label: string }[] = [
+  { value: 'kokoro', label: 'Kokoro (local)' },
+  { value: 'edge', label: 'Edge-TTS' },
+  { value: 'google', label: 'Google Cloud TTS (chave)' },
 ];
 
+function genderLabel(gender: string): string {
+  return gender === 'female' ? 'feminina' : gender === 'male' ? 'masculina' : '';
+}
+
 export default function StepVoice(props: Props) {
-  const { ttsEngine, setTtsEngine, voice, setVoice, rate, setRate } = props;
+  const { language, ttsEngine, setTtsEngine, voice, setVoice, rate, setRate } = props;
+
+  const voices = voicesForLanguage(language);
+  const provider: TtsProvider = PROVIDER_OF_ENGINE[ttsEngine];
+  const providerVoices = voices.filter((v) => v.provider === provider);
+  const shown = providerVoices.length > 0 ? providerVoices : voices;
+
+  const pickEngine = (engine: TtsEngine) => {
+    setTtsEngine(engine);
+    // Ao mudar de motor, escolher a primeira voz desse motor no idioma;
+    // se o motor não tiver voz no idioma, voltar à omissão do idioma.
+    const p: TtsProvider = PROVIDER_OF_ENGINE[engine];
+    const first = voices.find((v) => v.provider === p);
+    if (first) {
+      setVoice(first.voice);
+    } else {
+      const def = defaultVoiceFor(language);
+      setVoice(def.voice);
+      setTtsEngine(ENGINE_OF_PROVIDER[def.provider]);
+    }
+  };
 
   return (
     <div className="card">
       <h2>Voz</h2>
       <p className="muted">
-        Motor de texto-para-fala e voz da narração. O áudio real é gerado na
-        Fase 2 — aqui escolhes as preferências.
+        Motor de texto-para-fala e voz da narração — vozes do catálogo para o
+        idioma escolhido. O áudio real é gerado na Fase 2.
       </p>
 
       <div className="field">
         <span className="label">Motor de TTS</span>
         <div className="radio-group">
-          <label className="radio">
-            <input
-              type="radio"
-              name="tts-engine"
-              checked={ttsEngine === 'kokoro'}
-              onChange={() => setTtsEngine('kokoro')}
-            />
-            Kokoro (local)
-          </label>
-          <label className="radio">
-            <input
-              type="radio"
-              name="tts-engine"
-              checked={ttsEngine === 'edge'}
-              onChange={() => setTtsEngine('edge')}
-            />
-            Edge-TTS
-          </label>
-          <label className="radio">
-            <input
-              type="radio"
-              name="tts-engine"
-              checked={ttsEngine === 'google'}
-              onChange={() => setTtsEngine('google')}
-            />
-            Google Cloud TTS (chave)
-          </label>
+          {ENGINES.map((e) => (
+            <label className="radio" key={e.value}>
+              <input
+                type="radio"
+                name="tts-engine"
+                checked={ttsEngine === e.value}
+                onChange={() => pickEngine(e.value)}
+              />
+              {e.label}
+            </label>
+          ))}
         </div>
       </div>
 
@@ -69,14 +93,18 @@ export default function StepVoice(props: Props) {
           value={voice}
           onChange={(e) => setVoice(e.target.value)}
         >
-          {VOICES.map((v) => (
-            <option key={v.value} value={v.value}>
-              {v.label}
+          {shown.map((v) => (
+            <option key={`${v.provider}:${v.voice}`} value={v.voice}>
+              {v.voice} — {providerLabel(v.provider)}
+              {genderLabel(v.gender) ? `, voz ${genderLabel(v.gender)}` : ''}
+              {v.verified ? '' : ' (por verificar)'}
             </option>
           ))}
         </select>
         <p className="hint">
-          A lista final de vozes pt-PT (com pré-escuta) chega na Fase 2.
+          {shown.some((v) => !v.verified)
+            ? 'Vozes marcadas "(por verificar)" têm nomes da lista pública do provider — confirma no teu PC antes de usar.'
+            : 'Todas as vozes listadas têm nomes confirmados.'}
         </p>
       </div>
 

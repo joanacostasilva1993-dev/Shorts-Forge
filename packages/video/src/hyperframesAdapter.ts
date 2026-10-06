@@ -34,7 +34,7 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import type { FrameDescriptor } from './frames.js';
-import { escapeHtml } from './captions.js';
+import { escapeHtml, captionFontSizePx } from './captions.js';
 import { getTemplate, type BrandTemplate } from './templates.js';
 
 export interface CompositionOptions {
@@ -42,6 +42,8 @@ export interface CompositionOptions {
   height: number;
   fps?: number;
   compositionId?: string;
+  /** Narration language tag (e.g. "pt-PT") — drives the caption font budget. Defaults to "pt-PT". */
+  language?: string;
 }
 
 export interface RenderFramesOptions extends CompositionOptions {
@@ -54,6 +56,21 @@ export interface RenderFramesOptions extends CompositionOptions {
   workDir?: string;
   /** Timeout for the render CLI in ms. Defaults to 10 minutes. */
   timeoutMs?: number;
+  /**
+   * Pre-built composition HTML (e.g. already linted by
+   * lintCompositionHtml). When given, renderFrames writes these exact
+   * bytes instead of rebuilding from `frames` — so the lint gate and
+   * the render see the identical document.
+   */
+  prebuiltHtml?: string | undefined;
+  /** MP4 encoder CRF override (passed as hyperframes `--crf`). */
+  crf?: number | undefined;
+  /**
+   * Extra environment variables for the spawned hyperframes process
+   * (merged over process.env). Useful to redirect TMPDIR away from a
+   * small /tmp — hyperframes requires ~1 GB free on os.tmpdir().
+   */
+  env?: Record<string, string | undefined> | undefined;
 }
 
 /** One word recovered from caption HTML, with real timestamps. */
@@ -94,9 +111,9 @@ function isVideoUrl(url: string): boolean {
   return /\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(url);
 }
 
-function captionCss(template: BrandTemplate, width: number): string {
+function captionCss(template: BrandTemplate, width: number, language?: string): string {
   const scale = width / 1080;
-  const fontSize = Math.round(template.caption.fontSizePx * scale);
+  const fontSize = Math.round(captionFontSizePx(template, language ?? 'pt-PT') * scale);
   const strokePx = Math.max(0, Math.round(template.caption.strokePx * scale));
   const stroke = strokePx > 0
     ? `-webkit-text-stroke: ${strokePx}px #000; paint-order: stroke fill;`
@@ -121,7 +138,17 @@ function captionCss(template: BrandTemplate, width: number): string {
 .sf-caption .w.upcoming { opacity: .55; }
 .sf-scene { position: absolute; inset: 0; overflow: hidden; background: ${template.colors.bg}; }
 .sf-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.sf-hl { position: absolute; inset: 0; }`;
+.sf-hl { position: absolute; inset: 0; }
+.sf-hook {
+  position: absolute; left: 50%; top: 7%; transform: translateX(-50%);
+  width: 92%; text-align: center;
+  font-family: ${template.fontStack};
+  font-size: ${Math.round(template.caption.fontSizePx * 0.85 * scale)}px; font-weight: 900; line-height: 1.2;
+  color: ${template.colors.accent};
+  text-transform: uppercase;
+  text-shadow: 0 2px 12px rgba(0,0,0,.6);
+  pointer-events: none;
+}`;
 }
 
 function backgroundHtml(frame: FrameDescriptor, start: number): string {
@@ -150,6 +177,12 @@ function captionWithActive(words: ParsedCaptionWord[], activeIndex: number): str
     })
     .join(' ');
 }
+
+/**
+ * How long the hook-line overlay stays on screen at the start of a shot
+ * (seconds, clamped to the shot duration).
+ */
+export const HOOK_SHOW_SEC = 2.5;
 
 /**
  * Builds a complete, self-contained Hyperframes composition HTML string
@@ -192,14 +225,25 @@ export function buildCompositionHtml(
       );
     });
 
+    // Optional hook line: shown at the start of the shot, in the template
+    // accent colour. Clamped to the shot duration.
+    if (frame.hookLine) {
+      const hookDuration = Math.min(HOOK_SHOW_SEC, frame.durationSec);
+      scenes.push(
+        `<div class="clip sf-hookline" id="hook-${frame.segmentId}" data-start="${start}" data-duration="${hookDuration}" data-track-index="2">` +
+          `<div class="sf-hook">${escapeHtml(frame.hookLine)}</div>` +
+          `</div>`,
+      );
+    }
+
     offset += frame.durationSec;
   }
 
   return `<!DOCTYPE html>
-<html lang="pt-PT">
+<html lang="${escapeHtml(opts.language ?? 'pt-PT')}">
 <head>
 <meta charset="utf-8" />
-<style>${captionCss(template, opts.width)}</style>
+<style>${captionCss(template, opts.width, opts.language)}</style>
 </head>
 <body style="margin:0">
 <div data-composition-id="${escapeHtml(compositionId)}" data-start="0" data-duration="${total}" data-width="${opts.width}" data-height="${opts.height}" data-fps="${fps}" data-no-timeline style="position:relative;width:${opts.width}px;height:${opts.height}px">
@@ -231,7 +275,8 @@ function resolveTemplate(t: BrandTemplate | string | undefined): BrandTemplate {
 /**
  * Renders frames to a video file via the Hyperframes CLI.
  *
- * Steps: build composition HTML → write to workDir → spawn
+ * Steps: build composition HTML (or use `opts.prebuiltHtml`, e.g. the
+ * exact bytes that passed the lint gate) → write to workDir → spawn
  * `hyperframes render -c composition.html -o outPath` → verify output.
  *
  * Requires the hyperframes bundled browser on first use
@@ -251,16 +296,33 @@ export async function renderFrames(
   mkdirSync(dirname(outPath), { recursive: true });
 
   const compPath = join(workDir, 'composition.html');
-  writeFileSync(compPath, buildCompositionHtml(frames, template, opts), 'utf8');
+  writeFileSync(
+    compPath,
+    opts.prebuiltHtml ?? buildCompositionHtml(frames, template, opts),
+    'utf8',
+  );
 
   // NOTE: hyperframes resolves -c relative to cwd, so pass the bare filename.
   const timeout = opts.timeoutMs ?? 10 * 60 * 1000;
   const hfBin = hyperframesBin();
-  const res = spawnSync(
-    hfBin[0]!,
-    [...hfBin.slice(1), 'render', '-c', 'composition.html', '-o', outPath, '--quiet'],
-    { timeout, encoding: 'utf8', cwd: workDir },
-  );
+  const renderArgs = [
+    ...hfBin.slice(1),
+    'render',
+    '-c',
+    'composition.html',
+    '-o',
+    outPath,
+    '--quiet',
+  ];
+  if (opts.crf !== undefined) renderArgs.push('--crf', String(opts.crf));
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (opts.env) {
+    for (const [k, v] of Object.entries(opts.env)) {
+      if (v === undefined) delete env[k];
+      else env[k] = v;
+    }
+  }
+  const res = spawnSync(hfBin[0]!, renderArgs, { timeout, encoding: 'utf8', cwd: workDir, env });
   if (res.error) {
     throw new Error(`renderFrames: falha ao executar o CLI hyperframes: ${String(res.error)}`);
   }
@@ -275,7 +337,13 @@ export async function renderFrames(
 
 /**
  * Validates a generated composition with `hyperframes lint`.
- * Useful in Phase 3 pipelines before an expensive render.
+ * Useful as a gate before an expensive render.
+ *
+ * The HTML is written as `index.html` inside `workDir` because
+ * `hyperframes lint` expects a project *directory* (it discovers the
+ * composition via `index.html`). The `--json` output is parsed: the gate
+ * passes when there are no `error` findings. Warnings (e.g. the
+ * intentional flat-sibling karaoke structure) do not fail the gate.
  */
 export function lintCompositionHtml(
   html: string,
@@ -283,14 +351,36 @@ export function lintCompositionHtml(
 ): { ok: boolean; output: string } {
   const dir = resolve(workDir ?? join(process.cwd(), `.shorts-forge-hf-lint-${Date.now()}`));
   mkdirSync(dir, { recursive: true });
-  const compPath = join(dir, 'composition.html');
+  const compPath = join(dir, 'index.html');
   writeFileSync(compPath, html, 'utf8');
   const hfBin = hyperframesBin();
-  const res = spawnSync(hfBin[0]!, [...hfBin.slice(1), 'lint', compPath, '--json'], {
+  const res = spawnSync(hfBin[0]!, [...hfBin.slice(1), 'lint', dir, '--json'], {
     timeout: 60_000,
     encoding: 'utf8',
     cwd: dir,
   });
   const output = String(res.stdout ?? '') + String(res.stderr ?? '');
-  return { ok: res.status === 0, output };
+  return { ok: lintPassed(output, res.status), output };
+}
+
+/** Interprets `hyperframes lint --json` output for the gate. */
+function lintPassed(output: string, status: number | null): boolean {
+  const start = output.indexOf('{');
+  if (start >= 0) {
+    try {
+      const parsed = JSON.parse(output.slice(start)) as {
+        ok?: unknown;
+        errorCount?: unknown;
+      };
+      if (typeof parsed.ok === 'boolean') return parsed.ok && lintErrorCount(parsed) === 0;
+      return lintErrorCount(parsed) === 0;
+    } catch {
+      // fall through to the exit-code heuristic
+    }
+  }
+  return status === 0;
+}
+
+function lintErrorCount(parsed: { errorCount?: unknown }): number {
+  return typeof parsed.errorCount === 'number' ? parsed.errorCount : 0;
 }

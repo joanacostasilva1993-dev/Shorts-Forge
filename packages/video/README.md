@@ -16,8 +16,10 @@ frames via Hyperframes e montagem final com FFmpeg.
 | `frames.ts` | ✅ Real | `buildFrames`: 1 `FrameDescriptor` por segmento; duração = `actualDurationSec ?? targetDurationSec` |
 | `hyperframesAdapter.ts` | ✅ Real (verificado) | Gera composição Hyperframes e invoca o CLI `render`; composição validada com `hyperframes lint` (0 erros) e **render real executado e confirmado por frames extraídos** |
 | `preview.ts` | ✅ Real + testes | `writePreviewHtml` escreve HTML autónomo com cartões por segmento |
-| `ffmpeg.ts` (`detectHwAccel`, `buildAssembleArgs`) | ✅ Real + testes | Deteção de NVENC/VideoToolbox/QSV; construtor puro de argumentos FFmpeg |
-| `ffmpeg.ts` (`assemble`) | ⚠️ STUB | Lança `Error('STUB — …')`; precisa dos clips reais da Fase 4 |
+| `ffmpeg.ts` (`detectHwAccel`, `buildAssembleArgs`) | ✅ Real + testes | Deteção de NVENC/VideoToolbox/QSV **com probe real de encode** (só reporta o que funciona); construtor puro de argumentos FFmpeg |
+| `ffmpeg.ts` (`assemble`, `assembleJob`) | ✅ Real + testes | `assemble` executa o FFmpeg com `buildAssembleArgs()`; `assembleJob` é a entrada da Fase B (segmentos re-temporizados + clips + áudio TTS → `final.mp4`, com normalização/pad do áudio por segmento) |
+| `render.ts` | ✅ Real + testes | `buildSegmentFrame` → `buildSegmentComposition` → gate `lintCompositionHtml` → `renderFrames`: 1 clip MP4 por segmento; `renderJobSegments`, `renderPreviewMp4` (preview leve 360x640) e `renderJobVideo` (segmentos + `assembleJob`) |
+| `broll.ts` | ✅ Real + testes | `resolveBroll`/`resolveBrollForSegments`: cascata Pexels → Pixabay → Ken Burns → fundo de template; registo no-repeat; cache em `outputs/cache/broll/` |
 
 ## Templates (`templates.ts`)
 
@@ -136,30 +138,85 @@ Desenho da montagem (filter_complex):
   (`sidechaincompress`), misturada (`amix`) e o master é normalizado com
   `loudnorm` (I=-16, TP=-1.5, LRA=11).
 - **Codificação**: `h264_nvenc` / `h264_videotoolbox` / `h264_qsv` /
-  `libx264` conforme `hwAccel`; `yuv420p`; áudio `aac` 192k.
+  `libx264` conforme `hwAccel` (só aceleradores que passam num probe de
+  encode real); `yuv420p`; áudio `aac` 192k.
 
-`assemble()` é **stub intencional**: só pode executar na Fase 4, quando
-existirem os clips de segmento renderizados e as faixas de narração.
+`assembleJob()` normaliza cada faixa de narração (48 kHz estéreo,
+`apad`/`atrim` à duração real do segmento) antes de concatenar, para a
+timeline de áudio ficar amostra-a-amostra alinhada com o vídeo.
+
+## B-roll (`broll.ts`)
+
+Resolve o clip visual de cada segmento (Fase B, passo 3 do pipeline),
+pela cascata do `ARCHITECTURE.md` §7 — **nunca deixa um segmento sem
+visuais** e funciona **sem chaves nenhumas**:
+
+```ts
+import { resolveBrollForSegments } from '@shorts-forge/video';
+
+// depois de retimeSpec(): preenche segment.broll em todos os segmentos
+await resolveBrollForSegments(spec.segments, {
+  format: spec.format,            // '9:16' → pesquisa portrait
+  cacheDir: 'outputs/cache/broll',
+  projectDir: 'projects/meu-video', // guarda broll-registry.json
+});
+```
+
+1. **Pexels** (se `PEXELS_API_KEY` no `.env`) — pesquisa por
+   `visualKeywords` (`orientation=portrait` para 9:16); escolhe a
+   rendition mp4 mais próxima do alvo.
+2. **Pixabay** (se `PIXABAY_API_KEY`) — mesma lógica.
+3. **Ken Burns** (sem chaves / falha de API) — clip mp4 **real** gerado
+   com FFmpeg: zoom lento sobre um still em gradiente (5 paletas,
+   determinísticas por segmento). Enche exatamente o
+   `actualDurationSec`.
+4. **Fundo de template** (último recurso) — gradiente gerado com FFmpeg;
+   se nem o FFmpeg existir, o `broll` fica com `url: ''` e o
+   `buildFrames()` usa a cor do template — sempre válido.
+
+Regras:
+
+- **Pontuação** (`scoreCandidate`, determinística e documentada no
+  código): 55% relevância (overlap keywords/descrição ↔ tags), 35%
+  ajuste de duração (exato = 1,0; mais comprido decai até 0,7 — corta-se;
+  mais curto até 0,75 — tem de fazer loop), 10% orientação.
+  A duração do clip é registada **honestamente** — cortar ou fazer loop
+  é decisão de montagem, não daqui.
+- **No-repeat**: `UsedClipRegistry` (JSON em
+  `<projectDir>/broll-registry.json`) — um clip nunca se repete no mesmo
+  projeto, incluindo as variantes Ken Burns.
+- **Cache**: `<cacheDir>/<clipId>.mp4` — nunca se volta a sacar; a chave
+  inclui a origem + id do clip.
+- **Degradação graciosa**: erros/timeouts/rate-limits das APIs atravessam
+  a cascata em silêncio (log, sem crash).
+
+Testes em `src/test/broll.test.ts`: pontuação, no-repeat, ordem da
+cascata (HTTP simulado), cache hit/miss, mais 2 testes **ao vivo**
+guardados por `PEXELS_API_KEY`/`PIXABAY_API_KEY` (saltam com motivo
+claro quando não há chave — nunca simulados).
 
 ## Desenvolver
 
 ```bash
 npm run build      # tsc
 npm run typecheck  # tsc --noEmit
-npm test           # tsc + node --test (32 testes, verdes)
+npm test           # tsc + node --test (83 testes, 81 verdes, 2 saltos honestos)
 ```
 
-## Para a Fase 3/4
+## Para a Fase 3/4 (estado: feito)
 
-- **Fase 3 (pipeline)**: chamar `buildFrames(spec, templateId)` após a
-  re-temporização, depois `renderFrames(frames, …)` por segmento (ou
-  compor a timeline toda numa composição e fatiar); usar
-  `lintCompositionHtml` como gate antes de renders caros; expor
-  `writePreviewHtml` no passo de preview da UI.
-- **Fase 4 (montagem)**: implementar `assemble()` — é só `spawn` do
-  FFmpeg com `buildAssembleArgs(...)`; os testes do construtor de
-  argumentos já cobrem sidechaincompress, loudnorm, encoder por hwaccel
-  e canvas por formato.
-- **B-roll em vídeo**: o adaptador já emite `<video>` para URLs `.mp4`/
-  `.webm`/`.mov`; validar com um clip real (o teste usou imagem/fallback
-  de cor).
+- **Render por segmento**: `buildSegmentFrame(segment, template)` →
+  `buildSegmentComposition(…)` → `lintCompositionHtml` como gate →
+  `renderSegmentClip(…)` (ou `renderJobSegments(spec, …)` para a Spec
+  toda). Inclui hook line (`Segment.hookLine`, overlay na cor accent) e
+  legendas karaoke dos `words[]` reais do TTS.
+- **Preview**: `renderPreviewMp4(spec, outPath)` — render único a
+  360x640, servido em `GET /api/jobs/:id/preview` (com cache por hash da
+  Spec no pipeline).
+- **Montagem**: `assembleJob({ segments, segmentClips, outDir, format })`
+  — normaliza o áudio TTS por segmento e corre o FFmpeg com
+  `buildAssembleArgs(…)`; o pipeline chama-o na Fase B e expõe o
+  resultado em `GET /api/jobs/:id/download`.
+- **B-roll em vídeo**: o adaptador emite `<video>` para URLs `.mp4`/
+  `.webm`/`.mov`; `resolveBrollAssetUrl` prefere `localPath` (ficheiro
+  local → `file://`) e aceita URLs http(s).

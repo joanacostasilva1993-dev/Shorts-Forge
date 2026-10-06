@@ -236,7 +236,14 @@ if (cmdExists('ffprobe', ['-hide_banner', '-version'])) {
 {
   const requiredDoc = ['WHISPER_MODEL', 'KOKORO_VOICE', 'TTS_ENGINE', 'SPEECH_RATE'];
   const optionalDoc = ['GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_TTS_API_KEY', 'GOOGLE_TTS_VOICE'];
-  const exampleKeys = existsSync(envExamplePath) ? parseKeys(readFileSync(envExamplePath, 'utf8')) : [];
+  // Chaves documentadas incluem linhas comentadas `# CHAVE=` (documentada mas inativa por omissão).
+  const parseDocKeys = (text) =>
+    text
+      .split('\n')
+      .map((l) => l.trim().replace(/^#\s*/, ''))
+      .filter((l) => l && !l.startsWith('#') && l.includes('='))
+      .map((l) => l.slice(0, l.indexOf('=')));
+  const exampleKeys = existsSync(envExamplePath) ? parseDocKeys(readFileSync(envExamplePath, 'utf8')) : [];
   const missingDoc = requiredDoc.filter((k) => !exampleKeys.includes(k));
   if (missingDoc.length === 0) {
     ok('env Fase 2', `documentadas: ${requiredDoc.join(', ')}`);
@@ -258,6 +265,57 @@ if (cmdExists('ffprobe', ['-hide_banner', '-version'])) {
     ok('porta da API', 'contrato :3000 respeitado (ARCHITECTURE.md §8)');
   } else {
     warn('porta da API', `PIPELINE_API_PORT=${portVal} no .env.example — o contrato congelado exige :3000 (a UI tem o endereço fixo).`);
+  }
+  // SHORTS_FORGE_ROOT (Fase 3, i18n): opcional, só dev/testes — mas deve estar documentada.
+  if (exampleKeys.includes('SHORTS_FORGE_ROOT')) {
+    info('env SHORTS_FORGE_ROOT', 'documentada (opcional; só desenvolvimento/testes)');
+  } else {
+    warn('env SHORTS_FORGE_ROOT', 'em falta no .env.example (opcional, mas deve estar documentada)');
+  }
+}
+
+// --- 13. Chaves de B-roll: Pexels / Pixabay (Fase 3) --------------------------
+// Presente-ou-ausente SEM falhar: uma máquina limpa com zero chaves tem de
+// continuar a dar exit 0. Os valores nunca são mostrados.
+function dotEnvValue(name) {
+  try {
+    const text = readFileSync(join(rootDir, '.env'), 'utf8');
+    const line = text
+      .split('\n')
+      .map((l) => l.trim())
+      .find((l) => l.startsWith(`${name}=`) && !l.startsWith('#'));
+    if (!line) return null;
+    const v = line.slice(name.length + 1).trim();
+    if (!v || /cola-aqui|example|changeme|xxx/i.test(v)) return null;
+    return v; // nunca impresso
+  } catch {
+    return null;
+  }
+}
+for (const [name, label] of [
+  ['PEXELS_API_KEY', 'Pexels'],
+  ['PIXABAY_API_KEY', 'Pixabay'],
+]) {
+  if (dotEnvValue(name)) {
+    info(`B-roll: ${label}`, 'chave configurada no .env (valor oculto) — pesquisa de stock footage ativa');
+  } else {
+    info(
+      `B-roll: ${label}`,
+      'sem chave — o pipeline usa o fallback local (Ken Burns / fundo gerado). Chaves opcionais, nunca obrigatórias.',
+    );
+  }
+}
+
+// --- 14. Hyperframes CLI (Fase 3: renderFrames por segmento) ------------------
+{
+  const localBin = join(rootDir, 'node_modules', '.bin', 'hyperframes');
+  if (existsSync(localBin) || cmdExists('hyperframes', ['--version'])) {
+    ok('Hyperframes CLI', 'disponível (render de frames por segmento)');
+  } else {
+    warn(
+      'Hyperframes CLI',
+      'não encontrado — necessário para o renderFrames(). Corre `npm install` na raiz do repo.',
+    );
   }
 }
 

@@ -5,7 +5,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateSpec, validateSpecJson, SPEC_SYSTEM_PROMPT } from '../src/spec.js';
+import { generateSpec, validateSpecJson, SPEC_SYSTEM_PROMPT, buildSpecSystemPrompt } from '../src/spec.js';
 import type { ChatRequest, PipelineInput } from '@shorts-forge/shared';
 
 function mockRouter(data: unknown, capture: { req?: ChatRequest } = {}) {
@@ -183,5 +183,80 @@ describe('validateSpecJson', () => {
     const raw = validRawSpec();
     raw.segments[0]!['hookScore'] = 1.5;
     assert.throws(() => validateSpecJson(raw), /hookScore/);
+  });
+});
+
+describe('buildSpecSystemPrompt (i18n)', () => {
+  it('pt-PT keeps the EUROPEAN Portuguese guardrails', () => {
+    const p = buildSpecSystemPrompt('pt-PT');
+    assert.match(p, /EUROPEAN Portuguese/);
+    assert.match(p, /telemóvel/);
+    assert.match(p, /estou a fazer/);
+  });
+
+  it('pt-BR demands Brazilian Portuguese (and forbids pt-PT forms)', () => {
+    const p = buildSpecSystemPrompt('pt-BR');
+    assert.match(p, /BRAZILIAN Portuguese/);
+    assert.match(p, /celular/);
+    assert.match(p, /estou fazendo/);
+    assert.doesNotMatch(p, /EUROPEAN Portuguese/);
+  });
+
+  it('en demands natural spoken American English', () => {
+    const p = buildSpecSystemPrompt('en');
+    assert.match(p, /American English/);
+    assert.doesNotMatch(p, /EUROPEAN Portuguese/);
+  });
+
+  it('fr demands natural spoken French (France)', () => {
+    const p = buildSpecSystemPrompt('fr');
+    assert.match(p, /French \(France\)/);
+    assert.match(p, /"tu" forms/);
+  });
+
+  it('visualKeywords stay ENGLISH in every language', () => {
+    for (const lang of ['pt-PT', 'pt-BR', 'en', 'fr']) {
+      const p = buildSpecSystemPrompt(lang);
+      assert.match(p, /visualKeywords MUST be in ENGLISH/, `lang=${lang}`);
+      assert.match(p, /Pexels/, `lang=${lang}`);
+    }
+  });
+
+  it('unknown languages get a generic rule naming the tag', () => {
+    const p = buildSpecSystemPrompt('de');
+    assert.match(p, /"de"/);
+    assert.match(p, /visualKeywords MUST be in ENGLISH/);
+  });
+
+  it('SPEC_SYSTEM_PROMPT is the pt-PT specialization (backwards compat)', () => {
+    assert.equal(SPEC_SYSTEM_PROMPT, buildSpecSystemPrompt('pt-PT'));
+  });
+});
+
+describe('generateSpec language wiring (mocked LLM)', () => {
+  it('sends the French system prompt and returns spec.language "fr"', async () => {
+    const capture: { req?: ChatRequest } = {};
+    const spec = await generateSpec(
+      topicInput,
+      mockRouter(validRawSpec(), capture),
+      { language: 'fr' },
+    );
+    assert.equal(spec.language, 'fr');
+    const systemMsg = capture.req?.messages.find((m) => m.role === 'system')?.content ?? '';
+    assert.match(systemMsg, /French \(France\)/);
+    const userMsg = capture.req?.messages.find((m) => m.role === 'user')?.content ?? '';
+    assert.match(userMsg, /Narration language: fr/);
+  });
+
+  it('sends the pt-BR system prompt for Brazilian jobs', async () => {
+    const capture: { req?: ChatRequest } = {};
+    const spec = await generateSpec(
+      topicInput,
+      mockRouter(validRawSpec(), capture),
+      { language: 'pt-BR' },
+    );
+    assert.equal(spec.language, 'pt-BR');
+    const systemMsg = capture.req?.messages.find((m) => m.role === 'system')?.content ?? '';
+    assert.match(systemMsg, /BRAZILIAN Portuguese/);
   });
 });

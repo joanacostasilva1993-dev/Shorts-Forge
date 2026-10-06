@@ -12,7 +12,8 @@
  *   GET    /api/jobs/:id/events      → SSE (spec-draft, awaiting-approval,
  *                                      rendering, done, failed, progress)
  *   GET    /api/jobs/:id/download    → MP4 (quando existir; senão 404/409 honestos)
- *   GET    /api/jobs/:id/preview     → 501 honesto (Fase 4)
+ *   GET    /api/jobs/:id/preview     → MP4 de preview, baixa resolução
+ *                                      (render leve; 409 sem Spec aprovada)
  *   GET    /api/llm/status           → 200 { providers }
  *   POST   /api/llm/chat             → 200 ChatResult (passthrough debug)
  *
@@ -29,16 +30,19 @@ import {
   type Server,
   type ServerResponse,
 } from 'node:http';
-import { createReadStream, existsSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import type { ChatRequest, ChatResult } from '@shorts-forge/shared';
 import { createRouter, loadConfigFromEnv } from '@shorts-forge/llm-router';
-import { ApiError, type JobEvent } from './jobs.js';
+import { renderPreviewMp4 } from '@shorts-forge/video';
+import { ApiError, type Job, type JobEvent } from './jobs.js';
 import { ServiceClients } from './pythonBridge.js';
 import { ServiceManager } from './services.js';
 import { PipelineOrchestrator, type Pipeline } from './orchestrate.js';
 import { getProviderStatuses, type ProviderStatus } from './llmStatus.js';
+import { jobOutputsDir } from './outputs.js';
 
 export interface ServerDeps {
   pipeline: Pipeline;
@@ -48,6 +52,12 @@ export interface ServerDeps {
   llmStatus: () => Promise<ProviderStatus[]>;
   /** Called when the HTTP server closes (e.g. stop spawned services). */
   onClose?: () => void | Promise<void>;
+  /**
+   * Builds (or locates) the low-res preview MP4 for a job; returns its
+   * absolute path. Defaults to the real light Hyperframes render, cached
+   * per Spec hash. Tests inject a fast double.
+   */
+  buildPreview?: (job: Job) => Promise<string>;
 }
 
 export interface StartServerOptions {
@@ -205,10 +215,22 @@ async function handleJobs(
     const b = (body ?? {}) as Record<string, unknown>;
     const format = b['format'] ?? '9:16';
     const language = b['language'] ?? 'pt-PT';
+    const ttsRaw = b['tts'] as { engine?: unknown; voice?: unknown } | undefined;
+    const ttsChoice:
+      | { engine?: string | undefined; voice?: string | undefined }
+      | undefined =
+      ttsRaw && typeof ttsRaw === 'object'
+        ? {
+            ...(typeof ttsRaw.engine === 'string' ? { engine: ttsRaw.engine } : {}),
+            ...(typeof ttsRaw.voice === 'string' ? { voice: ttsRaw.voice } : {}),
+          }
+        : undefined;
     try {
       const job = await pipeline.createJob(
         input as Parameters<Pipeline['createJob']>[0],
-        { format: format as '9:16' | '16:9', language: language as string },
+        ttsChoice
+          ? { format: format as '9:16' | '16:9', language: language as string, ttsChoice }
+          : { format: format as '9:16' | '16:9', language: language as string },
       );
       sendJson(res, 201, { job });
     } catch (err) {
@@ -284,15 +306,10 @@ async function handleJobs(
     return;
   }
 
-  // GET /api/jobs/:id/preview — stub honesto até à Fase 4.
+  // GET /api/jobs/:id/preview — MP4 de preview, baixa resolução.
   if (sub === 'preview' && parts.length === 2) {
     if (method !== 'GET') return methodNotAllowed(res);
-    sendJson(res, 501, {
-      error: {
-        code: 'not_implemented',
-        message: 'A pré-visualização de vídeo ainda não está disponível — chega na Fase 4 (montagem de vídeo).',
-      },
-    });
+    await handlePreview(res, deps, id);
     return;
   }
 
@@ -400,7 +417,7 @@ async function handleSse(
   }
 }
 
-/** Serves the final MP4 when Phase 4 produces one; honest errors until then. */
+/** Serves the final MP4 when the job produced one; honest errors until then. */
 async function handleDownload(
   res: ServerResponse,
   deps: ServerDeps,
@@ -427,24 +444,104 @@ async function handleDownload(
       error: {
         code: 'video_not_ready',
         message:
-          'O vídeo ainda não foi montado — a montagem de vídeo (Fase 4) ainda não está ' +
-          'implementada. A Spec re-temporizada e o áudio TTS de cada segmento já estão prontos.',
+          'O job terminou mas o ficheiro de vídeo não foi encontrado. ' +
+          'Volta a correr o render ou verifica os logs do servidor.',
       },
     });
     return;
   }
-  const size = statSync(job.outputPath).size;
-  res.writeHead(200, {
+  serveMp4(res, job.outputPath, true);
+}
+
+/**
+ * Builds (when needed) and serves the low-res preview MP4.
+ * 404 for unknown jobs; 409 when the job has no approved Spec yet.
+ */
+async function handlePreview(
+  res: ServerResponse,
+  deps: ServerDeps,
+  id: string,
+): Promise<void> {
+  let job;
+  try {
+    job = await deps.pipeline.getJob(id);
+  } catch (err) {
+    sendError(res, err);
+    return;
+  }
+  const build = deps.buildPreview ?? defaultBuildPreview;
+  let previewPath: string;
+  try {
+    previewPath = await build(job);
+  } catch (err) {
+    sendError(res, err);
+    return;
+  }
+  if (!existsSync(previewPath)) {
+    sendJson(res, 500, {
+      error: {
+        code: 'preview_failed',
+        message: 'A pré-visualização falhou — verifica os logs do servidor.',
+      },
+    });
+    return;
+  }
+  serveMp4(res, previewPath, false);
+}
+
+/** Streams an MP4 file: attachment for downloads, inline for previews. */
+function serveMp4(res: ServerResponse, filePath: string, attachment: boolean): void {
+  const size = statSync(filePath).size;
+  const headers: Record<string, string> = {
     'Content-Type': 'video/mp4',
-    'Content-Length': size,
-    'Content-Disposition': `attachment; filename="${basename(job.outputPath)}"`,
-  });
-  const stream = createReadStream(job.outputPath);
+    'Content-Length': String(size),
+    'Accept-Ranges': 'bytes',
+  };
+  if (attachment) {
+    headers['Content-Disposition'] = `attachment; filename="${basename(filePath)}"`;
+  }
+  res.writeHead(200, headers);
+  const stream = createReadStream(filePath);
   stream.on('error', (err) => {
-    console.error('[pipeline] erro a servir o download:', err);
+    console.error('[pipeline] erro a servir o MP4:', err);
     if (!res.destroyed) res.destroy();
   });
   stream.pipe(res);
+}
+
+/**
+ * Default preview builder: a fast low-res Hyperframes render of the job's
+ * Spec, cached under `outputs/<jobId>/preview.mp4` and regenerated only
+ * when the Spec changes (sha256 sidecar).
+ */
+export async function defaultBuildPreview(job: Job): Promise<string> {
+  const spec = job.spec;
+  if (!spec) {
+    throw new ApiError(
+      'preview_not_ready',
+      409,
+      'O job ainda não tem uma Spec aprovada para pré-visualizar.',
+    );
+  }
+  const outDir = jobOutputsDir(job.id);
+  mkdirSync(outDir, { recursive: true });
+  const outPath = join(outDir, 'preview.mp4');
+  const hashPath = `${outPath}.spechash`;
+  const hash = createHash('sha256').update(JSON.stringify(spec)).digest('hex');
+  try {
+    if (existsSync(outPath) && readFileSync(hashPath, 'utf8').trim() === hash) {
+      return outPath;
+    }
+  } catch {
+    // Cache miss or unreadable sidecar — render fresh.
+  }
+  await renderPreviewMp4(spec, outPath, {
+    format: job.format,
+    template: 'bold-social',
+    tmpDir: join(outDir, '.tmp'),
+  });
+  writeFileSync(hashPath, hash, 'utf8');
+  return outPath;
 }
 
 // ── Wiring (real dependencies) ─────────────────────────────────────

@@ -4,10 +4,12 @@
  * Contract: ARCHITECTURE.md §8 (UI ↔ backend).
  * Base: http://localhost:3000/api — jobs + SSE + preview/download.
  *
- * Fase 5 (skeleton): there is no backend yet, so every request fails fast
- * and every function throws Error('backend indisponível — Fase 2').
- * The wiring (URLs, methods, bodies) is already real, so Phase 5 only
- * needs to start the backend for these calls to work.
+ * The backend is real (packages/pipeline, :3000): createJob, generateSpec,
+ * approveSpec, renderJob, subscribeJobEvents, getPreviewUrl and
+ * getDownloadUrl all hit the frozen REST contract. getPreviewUrl() and
+ * getDownloadUrl() return plain URLs for <video> players / anchors —
+ * preview serves an inline low-res MP4, download serves the final MP4 as
+ * an attachment.
  */
 
 import type {
@@ -57,6 +59,8 @@ export interface ProviderStatus {
 export interface CreateJobOptions {
   format: VideoFormat;
   language: string;
+  /** Explicit per-job TTS choice (StepVoice); sent through to Phase B. */
+  tts?: { engine?: string; voice?: string };
 }
 
 const API_BASE = 'http://localhost:3000/api';
@@ -91,10 +95,16 @@ export async function createJob(
   input: PipelineInput,
   opts: CreateJobOptions,
 ): Promise<Job> {
+  const body: Record<string, unknown> = {
+    input,
+    format: opts.format,
+    language: opts.language,
+  };
+  if (opts.tts) body['tts'] = opts.tts;
   const { job } = await request<{ job: Job }>('/jobs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ input, format: opts.format, language: opts.language }),
+    body: JSON.stringify(body),
   });
   return job;
 }

@@ -32,9 +32,22 @@ export type JobEventType =
   | 'progress';
 
 /**
+ * Explicit per-job TTS choice from the UI (StepVoice → POST /api/jobs `tts`).
+ * Both fields optional; when absent, Phase B resolves from the language
+ * catalog (packages/tts/voices.catalog.json).
+ */
+export interface JobTtsChoice {
+  engine?: string | undefined;
+  voice?: string | undefined;
+}
+
+/**
  * A pipeline job. `format`/`language` come from `POST /api/jobs` and travel
- * with the job so Phase A/B stay consistent. `outputPath` is set by the
- * Phase 4 video assembly (unset until then — `/download` 409s honestly).
+ * with the job so Phase A/B stay consistent. `ttsChoice` carries the UI's
+ * explicit voice choice (StepVoice); when absent, Phase B resolves the
+ * voice from the language catalog (packages/tts/voices.catalog.json).
+ * `outputPath` is set by the Phase 4 video assembly (unset until then —
+ * `/download` 409s honestly).
  */
 export interface Job {
   id: string;
@@ -42,6 +55,8 @@ export interface Job {
   input: PipelineInput;
   format: VideoFormat;
   language: string;
+  /** Explicit per-job TTS choice from the UI (optional). */
+  ttsChoice?: JobTtsChoice;
   spec?: Spec;
   /** 0..1 overall progress. */
   progress: number;
@@ -100,7 +115,12 @@ export class JobStore {
   private readonly listeners = new Map<string, Set<(event: JobEvent) => void>>();
 
   /** Creates a job in `spec-draft` status. */
-  create(input: PipelineInput, format: VideoFormat, language: string): Job {
+  create(
+    input: PipelineInput,
+    format: VideoFormat,
+    language: string,
+    ttsChoice?: JobTtsChoice,
+  ): Job {
     const id = `job-${randomUUID()}`;
     const now = nowIso();
     const job: Job = {
@@ -113,6 +133,9 @@ export class JobStore {
       createdAt: now,
       updatedAt: now,
     };
+    if (ttsChoice && (ttsChoice.engine || ttsChoice.voice)) {
+      job.ttsChoice = { ...ttsChoice };
+    }
     this.jobs.set(id, job);
     return snapshot(job);
   }

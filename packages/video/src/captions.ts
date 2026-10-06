@@ -16,6 +16,80 @@ export interface CaptionCue {
 }
 
 /**
+ * Per-language caption budget.
+ *
+ * Why per language: the same content takes ~15–30% more characters in
+ * Portuguese/French than in English (standard expansion rates used in
+ * subtitling — cf. EBU-TT/Netflix timed-text guidance, where Latin-script
+ * budgets sit around 32–42 chars/line for broadcast and Romance languages
+ * are routinely set tighter). On a vertical phone canvas with big display
+ * type we go tighter still, so Portuguese gets shorter lines than English
+ * and a slightly smaller font to fit its longer words.
+ */
+export interface CaptionBudget {
+  /** Max characters per caption line. */
+  maxCharsPerLine: number;
+  /** Max lines shown at once. */
+  maxLines: number;
+  /** Multiplier over the template's caption font size. */
+  fontScale: number;
+}
+
+const CAPTION_BUDGETS: Record<string, CaptionBudget> = {
+  pt: { maxCharsPerLine: 28, maxLines: 2, fontScale: 0.94 },
+  en: { maxCharsPerLine: 34, maxLines: 2, fontScale: 1.0 },
+  fr: { maxCharsPerLine: 30, maxLines: 2, fontScale: 0.96 },
+};
+
+const DEFAULT_BUDGET: CaptionBudget = CAPTION_BUDGETS['en']!;
+
+/**
+ * Returns the caption budget for a narration language tag ("pt-PT",
+ * "pt-BR" → pt; "fr" → fr; "en" → en). Unknown tags fall back to English.
+ */
+export function getCaptionBudget(language: string): CaptionBudget {
+  const base = language.trim().toLowerCase().split('-')[0] ?? '';
+  return CAPTION_BUDGETS[base] ?? DEFAULT_BUDGET;
+}
+
+/**
+ * Greedy word wrap of caption words into lines of at most
+ * `maxCharsPerLine` characters. A single over-long word gets its own line
+ * (never split mid-word). Pure and deterministic.
+ */
+export function wrapCaptionLines(words: string[], maxCharsPerLine: number): string[] {
+  const lines: string[] = [];
+  let current = '';
+  for (const raw of words) {
+    const word = raw.trim();
+    if (!word) continue;
+    if (!current) {
+      current = word;
+      continue;
+    }
+    if (current.length + 1 + word.length <= maxCharsPerLine) {
+      current += ` ${word}`;
+    } else {
+      lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+/**
+ * Caption font size (px) for a template + narration language: the
+ * template's reference size scaled by the language budget.
+ */
+export function captionFontSizePx(
+  template: Pick<BrandTemplate, 'caption'>,
+  language: string,
+): number {
+  return Math.max(1, Math.round(template.caption.fontSizePx * getCaptionBudget(language).fontScale));
+}
+
+/**
  * Normalizes raw words into cues: drops zero/negative-duration words and
  * words with non-finite timestamps. Order is preserved (pass-through).
  */

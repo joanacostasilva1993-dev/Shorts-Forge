@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { detectHwAccel, buildAssembleArgs, assemble } from '../index.js';
 import type { AssembleOptions } from '../index.js';
 
@@ -83,6 +86,26 @@ test('requires at least one segment clip', () => {
   assert.throws(() => buildAssembleArgs(baseOpts({ segmentClips: [] })), /pelo menos um clip/);
 });
 
-test('assemble is an unmistakable stub', async () => {
-  await assert.rejects(() => assemble(baseOpts()), /STUB/);
+test('assemble: pre-flight honesto — clip em falta falha antes do FFmpeg', async () => {
+  await assert.rejects(
+    () => assemble(baseOpts({ segmentClips: ['/tmp/clip-que-nao-existe.mp4'] })),
+    /clip de segmento em falta/,
+  );
+});
+
+test('assemble: pre-flight honesto — narração em falta falha antes do FFmpeg', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sf-assemble-'));
+  const clip = join(dir, 'seg-01.mp4');
+  writeFileSync(clip, 'fake-bytes'); // existe: o pre-flight passa nos clips…
+  await assert.rejects(
+    () =>
+      assemble(
+        baseOpts({
+          segmentClips: [clip],
+          narrationTracks: [join(dir, 'narracao-que-nao-existe.wav')], // …e falha aqui
+          outPath: join(dir, 'final.mp4'),
+        }),
+      ),
+    /faixa de narração em falta/,
+  );
 });

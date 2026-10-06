@@ -7,15 +7,32 @@ import StepFormat from './components/StepFormat';
 import GateScript from './components/GateScript';
 import GateStoryboard from './components/GateStoryboard';
 import GateRender from './components/GateRender';
-import { initialState, type AppState } from './state';
+import { initialState, type AppState, type TtsEngine } from './state';
 import { generateMockSpec } from './mock';
+import { defaultVoiceFor } from './lib/voices';
 
 const STEP_NAMES = ['Entrada', 'Voz', 'Modelo visual', 'Formato e geração'];
+
+const ENGINE_OF_PROVIDER: Record<string, TtsEngine> = {
+  kokoro: 'kokoro',
+  'edge-tts': 'edge',
+  google: 'google',
+};
 
 export default function App() {
   const [state, setState] = useState<AppState>(initialState);
 
   const patch = (p: Partial<AppState>) => setState((s) => ({ ...s, ...p }));
+
+  /** Muda o idioma e repõe a voz omissa desse idioma. */
+  const setLanguage = (language: string) => {
+    const def = defaultVoiceFor(language);
+    patch({
+      language,
+      ttsEngine: ENGINE_OF_PROVIDER[def.provider] ?? 'kokoro',
+      voice: def.voice,
+    });
+  };
 
   const stepValid = (step: number): boolean => {
     if (step === 1) {
@@ -28,7 +45,7 @@ export default function App() {
   };
 
   const generate = () => {
-    const spec = generateMockSpec(state.topic, state.format);
+    const spec = generateMockSpec(state.topic, state.format, state.language);
     patch({ phase: 'gate-script', spec });
     window.scrollTo(0, 0);
   };
@@ -81,10 +98,13 @@ export default function App() {
               setAudioFileName={(audioFileName) => patch({ audioFileName })}
               topic={state.topic}
               setTopic={(topic) => patch({ topic })}
+              language={state.language}
+              setLanguage={setLanguage}
             />
           )}
           {state.step === 2 && (
             <StepVoice
+              language={state.language}
               ttsEngine={state.ttsEngine}
               setTtsEngine={(ttsEngine) => patch({ ttsEngine })}
               voice={state.voice}

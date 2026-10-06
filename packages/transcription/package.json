@@ -1,1 +1,10 @@
-{"description":"Serviço Python de transcrição (faster-whisper). Implementação na Fase 2; este pacote documenta o contrato HTTP.","license":"AGPL-3.0-only","name":"@shorts-forge/transcription","private":true,"version":"0.1.0"}
+{
+  "description": "Serviço Python de transcrição (faster-whisper). Implementação na Fase 2; este pacote documenta o contrato HTTP.",
+  "license": "AGPL-3.0-only",
+  "name": "@shorts-forge/transcription",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "test": "if [ ! -x service/.venv/bin/python ]; then echo 'transcription: venv Python em falta — testes adiados. Cria com: python3 -m venv service/.venv && service/.venv/bin/pip install -r service/requirements.txt'; else service/.venv/bin/python -m pytest tests/test_language_hint.py -q; fi"
+  }
+}

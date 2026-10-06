@@ -65,9 +65,22 @@ KOKORO_MODEL_DIR = Path(os.environ.get("KOKORO_MODEL_DIR", MODELS_DIR / "kokoro"
 WHISPER_MODEL_DIR = Path(os.environ.get("WHISPER_MODEL_DIR", MODELS_DIR / "whisper"))
 
 # Provider defaults (overridable per request via the `voice` field).
-KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "pf_dora")
-EDGE_VOICE = os.environ.get("EDGE_TTS_VOICE", "pt-PT-DuarteNeural")
-GOOGLE_TTS_VOICE = os.environ.get("GOOGLE_TTS_VOICE", "pt-PT-Neural2-A")
+# The catalog (packages/tts/voices.catalog.json) is the source of truth;
+# env vars keep precedence so a machine-level override always wins. The
+# import is wrapped: the service must start even if the catalog is missing.
+try:
+    from voices_catalog import provider_default_voice as _catalog_default
+except Exception:  # noqa: BLE001 — catalog missing/corrupt: use literals
+
+    def _catalog_default(provider: str) -> str:  # type: ignore[no-redef]
+        return {"kokoro": "pf_dora", "edge-tts": "pt-PT-DuarteNeural", "google": "pt-PT-Neural2-A"}[
+            provider
+        ]
+
+
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", _catalog_default("kokoro"))
+EDGE_VOICE = os.environ.get("EDGE_TTS_VOICE", _catalog_default("edge-tts"))
+GOOGLE_TTS_VOICE = os.environ.get("GOOGLE_TTS_VOICE", _catalog_default("google"))
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 

@@ -6,8 +6,13 @@ Transcription microservice for shorts-forge.
 Exposes the frozen HTTP contract consumed by
 `packages/pipeline/src/pythonBridge.ts` (`ServiceClients.transcribe`):
 
-    POST /transcribe  { "audioPath": string } -> TranscriptionResult
-    GET  /health                            -> { "ok": true, "modelsLoaded": [...] }
+    POST /transcribe  { "audioPath": string, "language"?: string } -> TranscriptionResult
+    GET  /health                                                  -> { "ok": true, "modelsLoaded": [...] }
+
+`language` is an OPTIONAL BCP-47-ish hint (e.g. "pt-PT", "fr") coming from
+the job language. It is mapped to a faster-whisper language code and passed
+as the `language` param of `model.transcribe()` — it biases detection, it
+never invents content. Unknown/absent values keep auto-detect.
 
 Runs faster-whisper locally with ``word_timestamps=True``. No mocks: every
 endpoint performs real work. The server binds to 127.0.0.1 only.
@@ -159,8 +164,35 @@ def _is_decode_error(exc: BaseException) -> bool:
     return any(m in text for m in decode_markers)
 
 
-def transcribe_file(audio_path: str) -> dict[str, Any]:
+# BCP-47-ish tags (the job language) -> faster-whisper language codes.
+# Only the four catalog languages map; anything else keeps auto-detect.
+WHISPER_LANG_MAP = {
+    "pt-PT": "pt",
+    "pt-BR": "pt",
+    "pt": "pt",
+    "en": "en",
+    "en-US": "en",
+    "en-GB": "en",
+    "fr": "fr",
+    "fr-FR": "fr",
+}
+
+
+def whisper_language_code(tag: str | None) -> str | None:
+    """Map a job language tag to a faster-whisper code, or None (auto-detect)."""
+    if not tag:
+        return None
+    return WHISPER_LANG_MAP.get(tag.strip())
+
+
+def transcribe_file(audio_path: str, language: str | None = None) -> dict[str, Any]:
     """Transcribe an audio file. Returns a TranscriptionResult dict.
+
+    Args:
+        audio_path: absolute path of the audio file.
+        language: optional BCP-47-ish hint (e.g. "pt-PT"); mapped to a
+            faster-whisper code and passed as the `language` transcribe
+            param. Unknown values fall back to auto-detect.
 
     Raises:
         FileNotFoundError: audio file does not exist / is not a file.
@@ -172,13 +204,16 @@ def transcribe_file(audio_path: str) -> dict[str, Any]:
         raise FileNotFoundError(f"ficheiro de áudio não encontrado: {audio_path}")
 
     model = get_model()
+    whisper_lang = whisper_language_code(language) if language else None
 
     try:
-        segments_iter, info = model.transcribe(
-            str(path),
+        transcribe_kwargs: dict[str, Any] = dict(
             word_timestamps=True,
             vad_filter=True,  # skip silence; keeps word times aligned to speech
         )
+        if whisper_lang:
+            transcribe_kwargs["language"] = whisper_lang
+        segments_iter, info = model.transcribe(str(path), **transcribe_kwargs)
         words: list[dict[str, Any]] = []
         texts: list[str] = []
         for segment in segments_iter:
@@ -282,8 +317,21 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # Optional language hint (BCP-47-ish, e.g. "pt-PT"); unknown values
+        # fall back to auto-detect inside transcribe_file.
+        language_hint = body.get("language")
+        if language_hint is not None and not isinstance(language_hint, str):
+            self._send_json(
+                400,
+                _error(
+                    "invalid_request",
+                    "pedido inválido: 'language' tem de ser uma string",
+                ),
+            )
+            return
+
         try:
-            result = transcribe_file(audio_path)
+            result = transcribe_file(audio_path, language=language_hint or None)
         except FileNotFoundError as exc:
             self._send_json(404, _error("audio_not_found", str(exc)))
         except ValueError as exc:

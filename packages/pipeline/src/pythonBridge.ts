@@ -7,7 +7,7 @@
  * e funcional contra o contrato abaixo.
  *
  * Contrato HTTP (loopback local):
- *   POST /transcribe  { audioPath: string }                        → TranscriptionResult
+ *   POST /transcribe  { audioPath: string, language?: string }        → TranscriptionResult
  *   POST /synthesize  { text, voice, rate, provider }              → TtsResult
  *   GET  /health                                                  → { ok: true, ... }
  *
@@ -110,16 +110,22 @@ export class ServiceClients {
   }
 
   /**
-   * POST /transcribe { audioPath } → TranscriptionResult.
+   * POST /transcribe { audioPath, language? } → TranscriptionResult.
+   *
+   * @param audioPath  Absolute path of the audio file to transcribe.
+   * @param language   Optional BCP-47-ish hint (e.g. "pt-PT") biasing
+   *   faster-whisper's language detection. Omitted = auto-detect.
    * Throws a clear pt-PT Error when the Phase 2 service is unreachable.
    */
-  async transcribe(audioPath: string): Promise<TranscriptionResult> {
+  async transcribe(audioPath: string, language?: string): Promise<TranscriptionResult> {
+    const body: Record<string, string> = { audioPath };
+    if (language !== undefined && language.trim() !== '') body['language'] = language.trim();
     let res: Response;
     try {
       res = await fetch(`${this.transcriptionBase}/transcribe`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ audioPath }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(TRANSCRIBE_TIMEOUT_MS),
       });
     } catch (err) {

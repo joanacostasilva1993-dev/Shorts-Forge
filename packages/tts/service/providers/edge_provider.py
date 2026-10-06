@@ -16,9 +16,10 @@ import uuid
 
 import config
 from providers.base import ProviderResult, ProviderUnavailable, SynthesisError, TtsProvider
+from voices_catalog import locale_from_voice
 from word_timing import measure_duration_sec, tokenize
 
-_VOICES_CACHE: dict = {"at": 0.0, "voices": []}
+_VOICES_CACHE: dict[str, dict] = {}  # locale -> {"at": float, "voices": list[str]}
 _VOICES_TTL_SEC = 120.0
 
 
@@ -36,20 +37,26 @@ async def _fetch_voices_async() -> list[dict]:
     return await edge_tts.list_voices()
 
 
-def list_pt_voices() -> list[str]:
-    """Exact pt-PT voice ShortNames, verified live (cached 120s)."""
+def list_voices_for_locale(locale: str) -> list[str]:
+    """Exact voice ShortNames for a BCP-47 locale, verified live (cached 120s per locale)."""
     now = time.monotonic()
-    if now - _VOICES_CACHE["at"] < _VOICES_TTL_SEC and _VOICES_CACHE["voices"]:
-        return _VOICES_CACHE["voices"]
+    entry = _VOICES_CACHE.get(locale)
+    if entry and now - entry["at"] < _VOICES_TTL_SEC and entry["voices"]:
+        return entry["voices"]
     try:
         voices = asyncio.run(_fetch_voices_async())
     except Exception as exc:  # noqa: BLE001 — network/DNS failures
         raise ProviderUnavailable(f"Edge-TTS indisponível (sem rede?): {exc}") from exc
-    pt = sorted(
-        v["ShortName"] for v in voices if v.get("Locale") == "pt-PT" and v.get("ShortName")
+    names = sorted(
+        v["ShortName"] for v in voices if v.get("Locale") == locale and v.get("ShortName")
     )
-    _VOICES_CACHE.update(at=now, voices=pt)
-    return pt
+    _VOICES_CACHE[locale] = {"at": now, "voices": names}
+    return names
+
+
+def list_pt_voices() -> list[str]:
+    """Backwards-compatible alias (generate_samples.py, contract tests)."""
+    return list_voices_for_locale("pt-PT")
 
 
 def _rate_to_edge(rate: float) -> str:
@@ -75,15 +82,23 @@ class EdgeProvider(TtsProvider):
             return False
 
     def resolve_voice(self, requested: str) -> str:
-        """Pick the effective voice: requested if real, else default, else first."""
-        available = list_pt_voices()  # raises ProviderUnavailable when offline
+        """Pick the effective voice: requested if real, else default, else first.
+
+        The locale is inferred from the requested voice name (e.g.
+        ``fr-FR-DeniseNeural`` → ``fr-FR``) so catalog voices in other
+        languages resolve against the right voice list instead of silently
+        falling back to a pt-PT voice.
+        """
+        locale = locale_from_voice(requested, default="pt-PT")
+        available = list_voices_for_locale(locale)  # raises ProviderUnavailable when offline
         if requested.strip() in available:
             return requested.strip()
-        if self.default_voice() in available:
-            return self.default_voice()
+        default = self.default_voice()
+        if locale_from_voice(default, default="pt-PT") == locale and default in available:
+            return default
         if available:
             return available[0]
-        raise ProviderUnavailable("o Edge-TTS não listou vozes pt-PT.")
+        raise ProviderUnavailable(f"o Edge-TTS não listou vozes {locale}.")
 
     def synthesize(self, text: str, voice: str, rate: float) -> ProviderResult:
         edge_tts = _require_edge_tts()

@@ -11,9 +11,9 @@ import { dirname, resolve } from 'node:path';
 import type { Spec } from '@shorts-forge/shared';
 import { buildFrames } from './frames.js';
 import { getTemplate } from './templates.js';
-import { escapeHtml } from './captions.js';
+import { escapeHtml, captionFontSizePx } from './captions.js';
 
-function previewCss(templateId: string): string {
+function previewCss(templateId: string, language: string): string {
   const t = getTemplate(templateId);
   return `
 body { font-family: ${t.fontStack}; background: #141419; color: #eee; margin: 0; padding: 32px; }
@@ -24,7 +24,7 @@ h1 { font-size: 22px; margin: 0 0 6px; }
 .card .timing { font-size: 13px; color: #aaa; margin: 6px 0 10px; font-variant-numeric: tabular-nums; }
 .card .narration { font-size: 16px; line-height: 1.5; margin-bottom: 14px; }
 .caption-box { background: ${t.colors.bg}; border-radius: 8px; padding: 18px; text-align: center;
-  font-size: ${t.caption.fontSizePx * 0.55}px; font-weight: 900; line-height: 1.35; text-transform: uppercase; }
+  font-size: ${captionFontSizePx(t, language) * 0.55}px; font-weight: 900; line-height: 1.35; text-transform: uppercase; }
 .caption-box .w.active { color: ${t.colors.highlight}; }
 .caption-box .w.upcoming { opacity: .55; }`;
 }
@@ -52,11 +52,11 @@ export function writePreviewHtml(spec: Spec, templateId: string, outPath: string
   });
 
   const html = `<!DOCTYPE html>
-<html lang="pt-PT">
+<html lang="${escapeHtml(spec.language)}">
 <head>
 <meta charset="utf-8" />
 <title>Pré-visualização — ${escapeHtml(spec.title)}</title>
-<style>${previewCss(templateId)}</style>
+<style>${previewCss(templateId, spec.language)}</style>
 </head>
 <body>
 <h1>${escapeHtml(spec.title)}</h1>

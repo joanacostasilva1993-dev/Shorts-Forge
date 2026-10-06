@@ -19,7 +19,7 @@
  * restart do servidor (a biblioteca de projetos durável é Fase 6).
  */
 
-export { generateSpec, validateSpecJson, SPEC_SYSTEM_PROMPT } from './spec.js';
+export { generateSpec, validateSpecJson, SPEC_SYSTEM_PROMPT, buildSpecSystemPrompt } from './spec.js';
 export type { GenerateSpecOptions, SpecRouterLike } from './spec.js';
 
 export { retimeSpec, totalDurationSec, DEFAULT_BREATH_MARGIN_SEC } from './retime.js';
@@ -31,7 +31,7 @@ export { ServiceClients } from './pythonBridge.js';
 export type { ServiceBaseUrls, TtsProvider } from './pythonBridge.js';
 
 export { JobStore, ApiError, jobNotFound } from './jobs.js';
-export type { Job, JobStatus, JobEvent, JobEventType } from './jobs.js';
+export type { Job, JobStatus, JobEvent, JobEventType, JobTtsChoice } from './jobs.js';
 
 export { ServiceManager } from './services.js';
 export type { ServiceManagerOptions, ServiceKind } from './services.js';
@@ -39,11 +39,29 @@ export type { ServiceManagerOptions, ServiceKind } from './services.js';
 export { resolveTtsConfig } from './ttsConfig.js';
 export type { TtsConfig } from './ttsConfig.js';
 
+export {
+  loadVoiceCatalog,
+  resetVoiceCatalogCache,
+  supportedLanguages,
+  isSupportedLanguage,
+  getLanguageEntry,
+  whisperLanguageCode,
+  resolveTtsForJob,
+} from './voiceCatalog.js';
+export type {
+  CatalogVoice,
+  LanguageEntry,
+  VoiceCatalogData,
+  ResolvedJobTts,
+} from './voiceCatalog.js';
+
 export { getProviderStatuses } from './llmStatus.js';
 export type { ProviderStatus } from './llmStatus.js';
 
-export { PipelineOrchestrator } from './orchestrate.js';
-export type { Pipeline, OrchestratorDeps } from './orchestrate.js';
+export { PipelineOrchestrator, defaultRenderVideo } from './orchestrate.js';
+export type { Pipeline, OrchestratorDeps, RenderVideoFn } from './orchestrate.js';
 
-export { createServer, startServer } from './server.js';
+export { jobOutputsDir, outputsRoot } from './outputs.js';
+
+export { createServer, startServer, defaultBuildPreview } from './server.js';
 export type { ServerDeps, StartServerOptions, StartedServer } from './server.js';

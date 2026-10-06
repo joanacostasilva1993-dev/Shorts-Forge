@@ -23,6 +23,14 @@ export interface Word {
 export type VideoFormat = '9:16' | '16:9';
 
 /**
+ * Where a resolved B-roll clip comes from:
+ *  - 'pexels' | 'pixabay': stock video via the provider's free API tier;
+ *  - 'image': Ken Burns clip (slow zoom/pan) generated locally with FFmpeg;
+ *  - 'template': gradient background generated locally (last resort).
+ */
+export type BrollProvider = 'pexels' | 'pixabay' | 'image' | 'template';
+
+/**
  * One timed shot of the final video.
  *
  * A Segment starts life as a plan (Phase A: LLM output) — id, narration,
@@ -53,10 +61,22 @@ export interface Segment {
   };
   /** Resolved B-roll clip for this shot (Phase B). */
   broll?: {
-    provider: 'pexels' | 'pixabay' | 'image';
+    provider: BrollProvider;
     clipId: string;
+    /**
+     * Source URL of the clip. For downloaded/cached API clips this is the
+     * remote file URL; for locally generated clips ('image' Ken Burns,
+     * 'template' gradient) it is the local path; for the dependency-free
+     * template fallback (no FFmpeg) it is '' — buildFrames() then falls
+     * back to the template colour, so the segment still has visuals.
+     */
     url: string;
+    /** Local cached/generated MP4, when one exists (never re-downloaded). */
+    localPath?: string;
+    /** Honest duration of the clip in seconds (renderer trims/loops). */
     durationSec: number;
+    /** Required attribution, e.g. "Video by X from Pexels" (when any). */
+    attribution?: string;
   };
   /** Real shot duration after re-timing with TTS word timestamps (Phase B). */
   actualDurationSec?: number;

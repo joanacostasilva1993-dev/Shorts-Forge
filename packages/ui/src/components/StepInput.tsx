@@ -1,4 +1,5 @@
 import type { InputTab } from '../state';
+import { supportedLanguages } from '../lib/voices';
 
 interface Props {
   inputTab: InputTab;
@@ -7,10 +8,12 @@ interface Props {
   setAudioFileName: (name: string | null) => void;
   topic: string;
   setTopic: (topic: string) => void;
+  language: string;
+  setLanguage: (language: string) => void;
 }
 
 export default function StepInput(props: Props) {
-  const { inputTab, setInputTab, audioFileName, setAudioFileName, topic, setTopic } = props;
+  const { inputTab, setInputTab, audioFileName, setAudioFileName, topic, setTopic, language, setLanguage } = props;
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -44,6 +47,26 @@ export default function StepInput(props: Props) {
         >
           Tema
         </button>
+      </div>
+
+      <div className="field">
+        <label htmlFor="language">Idioma do vídeo</label>
+        <select
+          id="language"
+          value={language}
+          onChange={(e) => setLanguage(e.target.value)}
+        >
+          {supportedLanguages().map((l) => (
+            <option key={l.tag} value={l.tag}>
+              {l.label}
+            </option>
+          ))}
+        </select>
+        <p className="hint">
+          {inputTab === 'audio'
+            ? 'Usado como pista para a transcrição e para a voz da narração.'
+            : 'O LLM escreve o guião neste idioma e a narração usa uma voz correspondente.'}
+        </p>
       </div>
 
       {inputTab === 'audio' ? (

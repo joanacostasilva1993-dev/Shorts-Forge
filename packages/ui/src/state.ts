@@ -12,6 +12,8 @@ export interface WizardState {
   inputTab: InputTab;
   audioFileName: string | null;
   topic: string;
+  /** Narration language tag (catálogo: pt-PT, pt-BR, en, fr). */
+  language: string;
   ttsEngine: TtsEngine;
   voice: string;
   rate: number;
@@ -31,8 +33,9 @@ export const initialState: AppState = {
   inputTab: 'topic',
   audioFileName: null,
   topic: '',
-  ttsEngine: 'kokoro',
-  voice: 'kokoro-pt-1',
+  language: 'pt-PT',
+  ttsEngine: 'edge',
+  voice: 'pt-PT-DuarteNeural',
   rate: 1.0,
   template: 'intenso',
   format: '9:16',

@@ -108,6 +108,13 @@ function makeOrchestrator(
     serviceManager: fakeServiceManager(),
     store: new JobStore(),
     transcriptCacheDir: cacheDir,
+    // Fast video double: the real render (Hyperframes + FFmpeg) is covered
+    // by the video package's e2e test; here we only assert the wiring.
+    renderVideo: async (spec, opts) => {
+      assert.ok(spec.segments.length > 0, 'renderVideo recebe a Spec re-temporizada');
+      assert.ok(opts.outDir.length > 0);
+      return join(opts.outDir, 'final.mp4');
+    },
   });
 }
 
@@ -162,6 +169,11 @@ describe('ciclo de vida completo (topic)', () => {
     assert.equal(done.status, 'done');
     assert.equal(done.progress, 1);
     assert.ok(done.spec);
+    // A Fase B termina com o MP4 final (o passo de vídeo foi chamado).
+    assert.ok(
+      done.outputPath?.endsWith('final.mp4'),
+      `outputPath aponta para o MP4 final: ${done.outputPath}`,
+    );
 
     // DoD da Fase 2: segments[].tts com durações reais + spec re-temporizada.
     for (const segment of done.spec.segments) {
@@ -360,5 +372,149 @@ describe('specEvents (AsyncIterable)', () => {
       },
       (err: unknown) => err instanceof ApiError && err.code === 'job_not_found',
     );
+  });
+});
+
+describe('i18n end-to-end (idioma → transcrição → LLM → TTS → legendas)', () => {
+  const ENV_KEYS = ['TTS_ENGINE', 'KOKORO_VOICE', 'EDGE_TTS_VOICE', 'GOOGLE_TTS_VOICE', 'SPEECH_RATE'];
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const k of ENV_KEYS) {
+      savedEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+  });
+
+  /** mockServices variant that captures synthesize/transcribe arguments. */
+  function capturingServices(capture: {
+    synth?: { text: string; voice: string; rate: number; provider: string }[];
+    transcribeLang?: string[];
+  }): ServiceClients {
+    let synthCount = 0;
+    return {
+      transcriptionBase: 'http://127.0.0.1:9',
+      ttsBase: 'http://127.0.0.1:9',
+      transcribe: async (_audioPath: string, language?: string) => {
+        capture.transcribeLang?.push(language ?? '');
+        return {
+          text: 'olá mundo',
+          words: [
+            { word: 'olá', start: 0, end: 0.4 },
+            { word: 'mundo', start: 0.4, end: 0.8 },
+          ],
+          language: 'pt',
+        };
+      },
+      synthesize: async (text: string, voice: string, rate = 1.0, provider = 'kokoro') => {
+        synthCount += 1;
+        capture.synth?.push({ text, voice, rate, provider });
+        const tokens = text.split(/\s+/).filter((t) => t.length > 0);
+        const words = tokens.map((word, i) => ({ word, start: i * 0.4, end: i * 0.4 + 0.35 }));
+        const last = words[words.length - 1];
+        return {
+          audioPath: `/tmp/mock-tts-${synthCount}.wav`,
+          words,
+          durationSec: last ? last.end : 0.5,
+          voice: voice || 'mock-voice',
+        };
+      },
+      health: async () => ({ transcription: true, tts: true }),
+    } as unknown as ServiceClients;
+  }
+
+  function fullCycle(
+    orch: PipelineOrchestrator,
+    input: PipelineInput,
+    opts: { format: '9:16' | '16:9'; language: string; ttsChoice?: { engine?: string; voice?: string } },
+  ) {
+    return (async () => {
+      const created = await orch.createJob(input, opts);
+      const spec = await orch.generateSpec(created.id);
+      await orch.approveSpec(created.id, spec);
+      await orch.render(created.id);
+      return waitForTerminal(orch, created.id);
+    })();
+  }
+
+  it('createJob rejeita idioma não suportado (400 unsupported_language)', async () => {
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()));
+    await assert.rejects(
+      orch.createJob({ kind: 'topic', topic: 'x' }, { format: '9:16', language: 'de' }),
+      (err: unknown) => {
+        assert.ok(err instanceof ApiError);
+        assert.equal(err.code, 'unsupported_language');
+        assert.equal(err.httpStatus, 400);
+        return true;
+      },
+    );
+  });
+
+  it('createJob aceita os 4 idiomas e guarda a escolha de voz da UI', async () => {
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()));
+    for (const language of ['pt-PT', 'pt-BR', 'en', 'fr']) {
+      const job = await orch.createJob(
+        { kind: 'topic', topic: 'x' },
+        { format: '9:16', language, ttsChoice: { engine: 'edge', voice: 'custom-voice' } },
+      );
+      assert.equal(job.language, language);
+      assert.deepEqual(job.ttsChoice, { engine: 'edge', voice: 'custom-voice' });
+    }
+  });
+
+  it('job francês: Fase B usa a voz omissa do catálogo (kokoro/ff_siwis)', async () => {
+    const capture: { synth?: { text: string; voice: string; rate: number; provider: string }[] } = { synth: [] };
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()), capturingServices(capture));
+    const done = await fullCycle(orch, { kind: 'topic', topic: 'bonjour' }, { format: '9:16', language: 'fr' });
+    assert.equal(done.status, 'done');
+    assert.ok(capture.synth && capture.synth.length > 0);
+    for (const s of capture.synth) {
+      assert.equal(s.provider, 'kokoro');
+      assert.equal(s.voice, 'ff_siwis');
+    }
+  });
+
+  it('job pt-PT: Fase B usa a voz omissa do catálogo (edge-tts/pt-PT-DuarteNeural)', async () => {
+    const capture: { synth?: { text: string; voice: string; rate: number; provider: string }[] } = { synth: [] };
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()), capturingServices(capture));
+    const done = await fullCycle(orch, { kind: 'topic', topic: 'olá' }, { format: '9:16', language: 'pt-PT' });
+    assert.equal(done.status, 'done');
+    for (const s of capture.synth ?? []) {
+      assert.equal(s.provider, 'edge-tts');
+      assert.equal(s.voice, 'pt-PT-DuarteNeural');
+    }
+  });
+
+  it('escolha explícita da UI (ttsChoice) vence o catálogo na Fase B', async () => {
+    const capture: { synth?: { text: string; voice: string; rate: number; provider: string }[] } = { synth: [] };
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()), capturingServices(capture));
+    const done = await fullCycle(
+      orch,
+      { kind: 'topic', topic: 'olá' },
+      { format: '9:16', language: 'pt-PT', ttsChoice: { engine: 'kokoro', voice: 'pm_alex' } },
+    );
+    assert.equal(done.status, 'done');
+    for (const s of capture.synth ?? []) {
+      assert.equal(s.provider, 'kokoro');
+      assert.equal(s.voice, 'pm_alex');
+    }
+  });
+
+  it('transcrição recebe o idioma do job como hint', async () => {
+    const audioPath = join(cacheDir, 'voz-fr.mp3');
+    writeFileSync(audioPath, Buffer.from('fake-audio-bytes-fr'));
+    const capture: { transcribeLang?: string[] } = { transcribeLang: [] };
+    const orch = makeOrchestrator(mockRouter(llmSpecJson()), capturingServices(capture));
+    const job = await orch.createJob({ kind: 'audio', audioPath }, { format: '9:16', language: 'fr' });
+    await orch.generateSpec(job.id);
+    assert.deepEqual(capture.transcribeLang, ['fr']);
   });
 });

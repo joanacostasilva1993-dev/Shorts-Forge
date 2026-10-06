@@ -15,10 +15,14 @@
  * events, exactly like the frozen contract requires.
  *
  * Phase B (this phase's scope): per-segment TTS via `ServiceClients` with
- * REAL word timestamps, then `retimeSpec()` (pure, existing). The video
- * assembly step belongs to Phase 4: it is explicitly marked in the job
- * events, and the job finishes `done` with `outputPath` unset — `/download`
- * answers 409 honestly until Phase 4 lands. Nothing here fakes an MP4.
+ * REAL word timestamps, then `retimeSpec()` (pure, existing), then the real
+ * video render — per-segment Hyperframes clips + FFmpeg assembly via
+ * `@shorts-forge/video` — and the job finishes `done` with `outputPath`
+ * pointing at `outputs/<jobId>/final.mp4`, so `/download` serves it.
+ *
+ * The video step is injectable (`OrchestratorDeps.renderVideo`) so tests
+ * can substitute a fast double; the default is the real implementation.
+ * A render failure fails the job honestly (no fake MP4, ever).
  *
  * Known simplification (documented, Phase 3 candidate): for `kind: 'audio'`
  * inputs, Phase B re-synthesizes the narration with TTS instead of reusing
@@ -33,7 +37,7 @@ import type {
   TtsResult,
   VideoFormat,
 } from '@shorts-forge/shared';
-import { detectHwAccel } from '@shorts-forge/video';
+import { renderJobVideo, resolveBrollForSegments } from '@shorts-forge/video';
 import {
   generateSpec as generateSpecViaLlm,
   validateSpecJson,
@@ -43,13 +47,46 @@ import {
 import { retimeSpec } from './retime.js';
 import { getCachedTranscript, putCachedTranscript } from './cache.js';
 import { ServiceClients } from './pythonBridge.js';
-import { ApiError, Job, JobEvent, JobStore } from './jobs.js';
+import { ApiError, Job, JobEvent, JobStore, type JobTtsChoice } from './jobs.js';
 import type { ServiceManager } from './services.js';
-import { resolveTtsConfig } from './ttsConfig.js';
+import { getLanguageEntry, resolveTtsForJob } from './voiceCatalog.js';
+import { jobOutputsDir, outputsRoot } from './outputs.js';
+import { join } from 'node:path';
+
+/**
+ * The video step of Phase B: renders a re-timed spec to the final MP4.
+ * Returns the absolute final path. Injectable so tests can substitute a
+ * fast double; the default is the real `@shorts-forge/video` pipeline
+ * (per-segment Hyperframes clips + FFmpeg assembly).
+ */
+export type RenderVideoFn = (
+  spec: Spec,
+  opts: {
+    jobId: string;
+    format: VideoFormat;
+    outDir: string;
+    onProgress: (done: number, total: number, message: string) => void;
+  },
+) => Promise<string>;
+
+/** Default RenderVideoFn: the real per-segment render + assembly. */
+export async function defaultRenderVideo(
+  spec: Spec,
+  opts: { jobId: string; format: VideoFormat; outDir: string; onProgress: (done: number, total: number, message: string) => void },
+): Promise<string> {
+  return renderJobVideo(spec, {
+    outDir: opts.outDir,
+    format: opts.format,
+    onProgress: opts.onProgress,
+  });
+}
 
 /** The Pipeline interface (ARCHITECTURE.md §4.3). */
 export interface Pipeline {
-  createJob(input: PipelineInput, opts: { format: VideoFormat; language: string }): Promise<Job>;
+  createJob(
+    input: PipelineInput,
+    opts: { format: VideoFormat; language: string; ttsChoice?: JobTtsChoice },
+  ): Promise<Job>;
   /** Fase A: audio → transcribe (+cache) → LLM → strict validate → store. */
   generateSpec(jobId: string): Promise<Spec>;
   /** Utilizador edita/aprova: validate (strict) + store. */
@@ -72,6 +109,11 @@ export interface OrchestratorDeps {
   store?: JobStore;
   /** Transcript cache dir override (tests); defaults to the repo cache. */
   transcriptCacheDir?: string;
+  /**
+   * Phase B video step. Defaults to the real `@shorts-forge/video`
+   * render (`defaultRenderVideo`); tests inject a fast double.
+   */
+  renderVideo?: RenderVideoFn;
 }
 
 function errMsg(err: unknown): string {
@@ -86,6 +128,7 @@ export class PipelineOrchestrator implements Pipeline {
   private readonly serviceManager: ServiceManager;
   private readonly store: JobStore;
   private readonly transcriptCacheDir: string | undefined;
+  private readonly renderVideo: RenderVideoFn;
   /** Guards against concurrent generateSpec/render on the same job. */
   private readonly inFlight = new Set<string>();
 
@@ -95,6 +138,7 @@ export class PipelineOrchestrator implements Pipeline {
     this.serviceManager = deps.serviceManager;
     this.store = deps.store ?? new JobStore();
     this.transcriptCacheDir = deps.transcriptCacheDir;
+    this.renderVideo = deps.renderVideo ?? defaultRenderVideo;
   }
 
   /** Exposed for the server/SSE layer (shares the same store). */
@@ -104,12 +148,12 @@ export class PipelineOrchestrator implements Pipeline {
 
   async createJob(
     input: PipelineInput,
-    opts: { format: VideoFormat; language: string },
+    opts: { format: VideoFormat; language: string; ttsChoice?: JobTtsChoice },
   ): Promise<Job> {
     validateInput(input);
     const format = validateFormat(opts.format);
     const language = validateLanguage(opts.language);
-    return this.store.create(input, format, language);
+    return this.store.create(input, format, language, opts.ttsChoice);
   }
 
   async generateSpec(jobId: string): Promise<Spec> {
@@ -259,7 +303,10 @@ export class PipelineOrchestrator implements Pipeline {
     await this.ensureService('transcription');
     let result: TranscriptionResult;
     try {
-      result = await this.services.transcribe(audioPath);
+      // The job language travels as a transcription hint (faster-whisper
+      // `language` param) — it biases detection, it never forces a wrong
+      // language: unknown tags fall back to auto-detect server-side.
+      result = await this.services.transcribe(audioPath, job.language);
     } catch (err) {
       throw new ApiError('service_unavailable', 503, errMsg(err));
     }
@@ -292,11 +339,22 @@ export class PipelineOrchestrator implements Pipeline {
   private async runPhaseB(jobId: string): Promise<void> {
     try {
       await this.ensureService('tts');
-      const ttsConfig = resolveTtsConfig();
-
       const job = this.store.get(jobId);
       const spec = job.spec;
       if (!spec) throw new Error('a Spec desapareceu antes da Fase B');
+
+      // Language-aware voice resolution: explicit UI choice > env > catalog
+      // default for the job's language (see voiceCatalog.ts).
+      const ttsConfig = resolveTtsForJob({
+        language: job.language,
+        engine: job.ttsChoice?.engine,
+        voice: job.ttsChoice?.voice,
+      });
+      this.store.emit(
+        jobId,
+        'progress',
+        `Voz da narração: ${ttsConfig.voice} (${ttsConfig.provider}, idioma ${job.language}).`,
+      );
 
       const ttsBySegment = new Map<string, TtsResult>();
       const total = spec.segments.length;
@@ -327,24 +385,43 @@ export class PipelineOrchestrator implements Pipeline {
 
       // Re-time with REAL word timestamps — the heart of the architecture.
       const retimed = retimeSpec(spec, ttsBySegment);
-      this.store.update(jobId, { spec: retimed, progress: 0.9 });
+      this.store.update(jobId, { spec: retimed, progress: 0.8 });
       this.store.emit(
         jobId,
         'progress',
         'Spec re-temporizada com os tempos reais do áudio — sem drift.',
       );
 
-      // ── Video assembly: Phase 4 boundary (explicit stub) ──────────
-      // packages/video's assemble() is an honest Phase 4 stub (it throws),
-      // so this step only probes what's real today (FFmpeg availability)
-      // and marks the boundary in the event stream. No MP4 is faked.
-      const hwAccel = detectHwAccel();
-      const stubNote =
-        `Montagem de vídeo ainda não implementada (Fase 4) — FFmpeg detetado (${hwAccel}). ` +
-        `A Spec re-temporizada e o áudio TTS de cada segmento estão prontos.`;
-      this.store.update(jobId, { progress: 1, status: 'done' });
-      this.store.emit(jobId, 'rendering', stubNote);
-      this.store.emit(jobId, 'done', stubNote);
+      // ── B-roll resolution (real): semantic matching per segment with
+      // fallback cascade (Pexels → Pixabay → Ken Burns → template).
+      // A segment never ends without visuals; failures fall through
+      // silently inside the resolver (logged, never fatal).
+      this.store.emit(jobId, 'progress', 'A escolher o B-roll de cada segmento…');
+      await resolveBrollForSegments(retimed.segments, {
+        format: job.format,
+        cacheDir: join(outputsRoot(), 'cache', 'broll'),
+        projectDir: jobOutputsDir(jobId),
+        log: (message) => this.store.emit(jobId, 'progress', message),
+      });
+
+      // ── Video render (real): per-segment Hyperframes clips + FFmpeg ──
+      // Progress events stream to the UI over SSE via the store's event
+      // bus. Any failure here fails the job honestly — never a fake MP4.
+      this.store.emit(jobId, 'rendering', 'A renderizar os segmentos do vídeo…');
+      const outDir = jobOutputsDir(jobId);
+      const finalPath = await this.renderVideo(retimed, {
+        jobId,
+        format: job.format,
+        outDir,
+        onProgress: (done, totalSegs, message) => {
+          const progress = 0.8 + (0.2 * done) / Math.max(1, totalSegs);
+          this.store.update(jobId, { progress });
+          this.store.emit(jobId, 'progress', message);
+        },
+      });
+
+      this.store.update(jobId, { outputPath: finalPath, progress: 1, status: 'done' });
+      this.store.emit(jobId, 'done', 'Vídeo final pronto.');
     } catch (err) {
       const api =
         err instanceof ApiError
@@ -403,8 +480,12 @@ function validateFormat(format: unknown): VideoFormat {
 }
 
 function validateLanguage(language: unknown): string {
-  if (typeof language === 'string' && language.trim().length > 0) return language.trim();
-  throw new ApiError('invalid_input', 400, 'O campo "language" tem de ser uma string não vazia.');
+  if (typeof language !== 'string' || language.trim().length === 0) {
+    throw new ApiError('invalid_input', 400, 'O campo "language" tem de ser uma string não vazia.');
+  }
+  // Throws ApiError(400, unsupported_language) for unknown tags — the
+  // catalog (packages/tts/voices.catalog.json) is the authority.
+  return getLanguageEntry(language).tag;
 }
 
 function toPhaseAFailure(err: unknown): ApiError {

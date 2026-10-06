@@ -7,6 +7,9 @@ import {
   renderCaptionHtml,
   renderCaptionHtmlWithActive,
   parseCueTimings,
+  getCaptionBudget,
+  wrapCaptionLines,
+  captionFontSizePx,
 } from '../index.js';
 import { getTemplate } from '../index.js';
 
@@ -94,4 +97,48 @@ test('parseCueTimings recovers timings from caption HTML', () => {
     { start: 0.4, end: 0.9 },
     { start: 1.2, end: 1.7 },
   ]);
+});
+
+test('getCaptionBudget: per-language budgets (pt shorter lines than en)', () => {
+  const pt = getCaptionBudget('pt-PT');
+  const ptBr = getCaptionBudget('pt-BR');
+  const en = getCaptionBudget('en');
+  const fr = getCaptionBudget('fr');
+  assert.equal(pt.maxCharsPerLine, 28);
+  assert.equal(ptBr.maxCharsPerLine, 28);
+  assert.equal(en.maxCharsPerLine, 34);
+  assert.equal(fr.maxCharsPerLine, 30);
+  assert.ok(pt.maxCharsPerLine < en.maxCharsPerLine, 'português: linhas mais curtas que inglês');
+  assert.ok(pt.fontScale < 1, 'português: fonte ligeiramente menor');
+  assert.equal(en.fontScale, 1.0);
+});
+
+test('getCaptionBudget: unknown language falls back to English', () => {
+  assert.deepEqual(getCaptionBudget('de'), getCaptionBudget('en'));
+  assert.deepEqual(getCaptionBudget(''), getCaptionBudget('en'));
+});
+
+test('wrapCaptionLines: greedy wrap respecting maxCharsPerLine', () => {
+  const lines = wrapCaptionLines(['Olá', 'mundo', 'cruel', 'e', 'maravilhoso'], 10);
+  assert.deepEqual(lines, ['Olá mundo', 'cruel e', 'maravilhoso']);
+  for (const line of lines.slice(0, -1)) {
+    assert.ok(line.length <= 10);
+  }
+});
+
+test('wrapCaptionLines: over-long single word gets its own line', () => {
+  const lines = wrapCaptionLines(['anticonstitucionalissimamente'], 10);
+  assert.deepEqual(lines, ['anticonstitucionalissimamente']);
+});
+
+test('wrapCaptionLines: empty input → no lines', () => {
+  assert.deepEqual(wrapCaptionLines([], 28), []);
+});
+
+test('captionFontSizePx: applies the language budget over the template size', () => {
+  const t = getTemplate('bold-social'); // caption.fontSizePx = 68
+  assert.equal(captionFontSizePx(t, 'en'), 68);
+  assert.equal(captionFontSizePx(t, 'pt-PT'), Math.round(68 * 0.94));
+  assert.equal(captionFontSizePx(t, 'fr'), Math.round(68 * 0.96));
+  assert.equal(captionFontSizePx(t, 'xx'), 68, 'idioma desconhecido → orçamento inglês');
 });

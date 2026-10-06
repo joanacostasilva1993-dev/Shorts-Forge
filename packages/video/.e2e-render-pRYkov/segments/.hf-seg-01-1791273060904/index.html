@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+<meta charset="utf-8" />
+<style>
+.sf-caption {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 88%; text-align: center;
+  font-family: 'Archivo Black', 'Arial Black', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 64px; font-weight: 900; line-height: 1.28;
+  color: #ffffff;
+  text-transform: uppercase;
+  text-shadow: 0 2px 12px rgba(0,0,0,.55);
+  -webkit-text-stroke: 3px #000; paint-order: stroke fill;
+  pointer-events: none;
+}
+.sf-caption .w.active { color: #ffe14d; }
+.sf-caption .w.upcoming { opacity: .55; }
+.sf-scene { position: absolute; inset: 0; overflow: hidden; background: #0a0a12; }
+.sf-bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.sf-hl { position: absolute; inset: 0; }
+.sf-hook {
+  position: absolute; left: 50%; top: 7%; transform: translateX(-50%);
+  width: 92%; text-align: center;
+  font-family: 'Archivo Black', 'Arial Black', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 58px; font-weight: 900; line-height: 1.2;
+  color: #ff2e88;
+  text-transform: uppercase;
+  text-shadow: 0 2px 12px rgba(0,0,0,.6);
+  pointer-events: none;
+}</style>
+</head>
+<body style="margin:0">
+<div data-composition-id="sf-seg-01" data-start="0" data-duration="2.15" data-width="1080" data-height="1920" data-fps="30" data-no-timeline style="position:relative;width:1080px;height:1920px">
+<div class="clip sf-scene" id="scene-seg-01" data-start="0" data-duration="2.15" data-track-index="0" style="background: #0a0a12;"><div class="sf-caption"><span class="w">Olá</span> <span class="w">mundo</span> <span class="w">do</span> <span class="w">teste</span></div></div>
+<div class="clip sf-hl" id="hl-seg-01-w0" data-start="0.2" data-duration="0.39999999999999997" data-track-index="1"><div class="sf-caption"><span class="w active">Olá</span> <span class="w">mundo</span> <span class="w">do</span> <span class="w">teste</span></div></div>
+<div class="clip sf-hl" id="hl-seg-01-w1" data-start="0.6" data-duration="0.5000000000000001" data-track-index="1"><div class="sf-caption"><span class="w">Olá</span> <span class="w active">mundo</span> <span class="w">do</span> <span class="w">teste</span></div></div>
+<div class="clip sf-hl" id="hl-seg-01-w2" data-start="1.1" data-duration="0.19999999999999996" data-track-index="1"><div class="sf-caption"><span class="w">Olá</span> <span class="w">mundo</span> <span class="w active">do</span> <span class="w">teste</span></div></div>
+<div class="clip sf-hl" id="hl-seg-01-w3" data-start="1.3" data-duration="0.5999999999999999" data-track-index="1"><div class="sf-caption"><span class="w">Olá</span> <span class="w">mundo</span> <span class="w">do</span> <span class="w active">teste</span></div></div>
+<div class="clip sf-hookline" id="hook-seg-01" data-start="0" data-duration="2.15" data-track-index="2"><div class="sf-hook">Isto muda tudo</div></div>
+</div>
+</body>
+</html>
